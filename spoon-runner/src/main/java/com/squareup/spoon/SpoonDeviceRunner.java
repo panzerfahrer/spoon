@@ -1,12 +1,15 @@
 package com.squareup.spoon;
 
-import com.android.ddmlib.AndroidDebugBridge;
-import com.android.ddmlib.IDevice;
-import com.android.ddmlib.InstallException;
-import com.android.ddmlib.testrunner.RemoteAndroidTestRunner;
-import com.google.common.base.Strings;
-import com.google.common.collect.ArrayListMultimap;
-import com.google.common.collect.Multimap;
+import static com.squareup.spoon.Spoon.SPOON_SCREENSHOTS;
+import static com.squareup.spoon.SpoonLogger.logDebug;
+import static com.squareup.spoon.SpoonLogger.logError;
+import static com.squareup.spoon.SpoonLogger.logInfo;
+import static com.squareup.spoon.SpoonUtils.GSON;
+import static com.squareup.spoon.SpoonUtils.QUIET_MONITOR;
+import static com.squareup.spoon.SpoonUtils.createAnimatedGif;
+import static com.squareup.spoon.SpoonUtils.obtainDirectoryFileEntry;
+import static com.squareup.spoon.SpoonUtils.obtainRealDevice;
+
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
@@ -18,19 +21,21 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
+
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.filefilter.TrueFileFilter;
 
-import static com.android.ddmlib.FileListingService.FileEntry;
-import static com.squareup.spoon.Spoon.SPOON_SCREENSHOTS;
-import static com.squareup.spoon.SpoonLogger.logDebug;
-import static com.squareup.spoon.SpoonLogger.logError;
-import static com.squareup.spoon.SpoonLogger.logInfo;
-import static com.squareup.spoon.SpoonUtils.GSON;
-import static com.squareup.spoon.SpoonUtils.QUIET_MONITOR;
-import static com.squareup.spoon.SpoonUtils.createAnimatedGif;
-import static com.squareup.spoon.SpoonUtils.obtainDirectoryFileEntry;
-import static com.squareup.spoon.SpoonUtils.obtainRealDevice;
+import com.android.ddmlib.AndroidDebugBridge;
+import com.android.ddmlib.FileListingService.FileEntry;
+import com.android.ddmlib.IDevice;
+import com.android.ddmlib.InstallException;
+import com.android.ddmlib.testrunner.RemoteAndroidTestRunner;
+import com.github.rtyley.android.screenshot.paparazzo.processors.ScreenshotProcessor;
+import com.google.common.base.Strings;
+import com.google.common.collect.ArrayListMultimap;
+import com.google.common.collect.Collections2;
+import com.google.common.collect.Multimap;
 
 /** Represents a single device and the test configuration to be executed. */
 public final class SpoonDeviceRunner {
@@ -52,7 +57,7 @@ public final class SpoonDeviceRunner {
 
   /**
    * Create a test runner for a single device.
-   *
+   * 
    * @param sdk Path to the local Android SDK directory.
    * @param apk Path to application APK.
    * @param testApk Path to test application APK.
@@ -62,8 +67,8 @@ public final class SpoonDeviceRunner {
    * @param classpath Custom JVM classpath or {@code null}.
    * @param instrumentationInfo Test apk manifest information.
    * @param className Test class name to run or {@code null} to run all tests.
-   * @param methodName Test method name to run or {@code null} to run all tests.  Must also pass
-   *        {@code className}.
+   * @param methodName Test method name to run or {@code null} to run all tests. Must also pass
+   *          {@code className}.
    */
   SpoonDeviceRunner(File sdk, File apk, File testApk, File output, String serial, boolean debug,
       String classpath, SpoonInstrumentationInfo instrumentationInfo, String className,
@@ -81,7 +86,9 @@ public final class SpoonDeviceRunner {
     this.instrumentationInfo = instrumentationInfo;
   }
 
-  /** Serialize ourself to disk and start {@link #main(String...)} in another process. */
+  /**
+   * Serialize ourself to disk and start {@link #main(String...)} in another process.
+   */
   public DeviceResult runInNewProcess() throws IOException, InterruptedException {
     logDebug(debug, "[%s]", serial);
 
@@ -93,10 +100,11 @@ public final class SpoonDeviceRunner {
     GSON.toJson(this, executionWriter);
     executionWriter.close();
 
-    // Kick off a new process to interface with ADB and perform the real execution.
+    // Kick off a new process to interface with ADB and perform the real
+    // execution.
     String name = SpoonDeviceRunner.class.getName();
-    Process process =
-        new ProcessBuilder("java", "-cp", classpath, name, work.getAbsolutePath()).start();
+    Process process = new ProcessBuilder("java", "-cp", classpath, name, work.getAbsolutePath())
+        .start();
     printStream(process.getInputStream(), "STDOUT");
     printStream(process.getErrorStream(), "STDERR");
     final int exitCode = process.waitFor();
@@ -140,7 +148,8 @@ public final class SpoonDeviceRunner {
     logDebug(debug, "[%s] setDeviceDetails %s", serial, deviceDetails);
 
     try {
-      // First try to uninstall the old apks.  This will avoid "inconsistent certificate" errors.
+      // First try to uninstall the old apks. This will avoid
+      // "inconsistent certificate" errors.
       tryToUninstall(device, instrumentationInfo.getApplicationPackage());
       tryToUninstall(device, instrumentationInfo.getInstrumentationPackage());
 
@@ -161,13 +170,31 @@ public final class SpoonDeviceRunner {
       return result.markInstallAsFailed(e.getMessage()).build();
     }
 
+    // Prepare for screenshots
+    work.mkdirs();
+
+    // create the output directory, if it does not already exist.
+    File imageDir = FileUtils.getFile(output, "image", serial);
+    imageDir.mkdirs();
+
+    final String dirName = "app_" + SPOON_SCREENSHOTS;
+    final String localDirName = work.getAbsolutePath();
+    final String devicePath = "/data/data/" + appPackage + "/" + dirName;
+    Multimap<DeviceTest, File> screenshots = ArrayListMultimap.create();
+
+    SpoonScreenshotProcessor screenshotProcessor = new SpoonScreenshotProcessor(device, imageDir);
+    SpoonScreenshotService screenshotService = new SpoonScreenshotService(device,
+        screenshotProcessor);
+
     // Initiate device logging.
     SpoonDeviceLogger deviceLogger = new SpoonDeviceLogger(device);
 
     // Run all the tests! o/
     try {
       logDebug(debug, "About to actually run tests for [%s]", serial);
+
       RemoteAndroidTestRunner runner = new RemoteAndroidTestRunner(testPackage, testRunner, device);
+
       if (!Strings.isNullOrEmpty(className)) {
         if (Strings.isNullOrEmpty(methodName)) {
           runner.setClassName(className);
@@ -175,7 +202,9 @@ public final class SpoonDeviceRunner {
           runner.setMethodName(className, methodName);
         }
       }
+      screenshotService.start();
       runner.run(new SpoonTestRunListener(result, debug));
+      screenshotService.finish();
     } catch (Exception e) {
       result.addException(e);
     }
@@ -189,29 +218,34 @@ public final class SpoonDeviceRunner {
       }
     }
 
+    // Grab all screenshots taken via DDMS
+    Multimap<DeviceTest, File> ddmsScreenshots = screenshotProcessor.getScreenshots();
+    for (Entry<DeviceTest, File> entry : ddmsScreenshots.entries()) {
+      DeviceTest testIdentifier = entry.getKey();
+      DeviceTestResult.Builder builder = result.getMethodResultBuilder(testIdentifier);
+
+      if (builder != null) {
+        File screenshot = entry.getValue();
+        builder.addScreenshot(screenshot);
+        screenshots.put(testIdentifier, screenshot);
+      }
+    }
+
     try {
       logDebug(debug, "About to grab screenshots and prepare output for [%s]", serial);
-      // Create the output directory, if it does not already exist.
-      work.mkdirs();
 
       // Sync device screenshots, if any, to the local filesystem.
-      String dirName = "app_" + SPOON_SCREENSHOTS;
-      String localDirName = work.getAbsolutePath();
-      final String devicePath = "/data/data/" + appPackage + "/" + dirName;
       FileEntry deviceDir = obtainDirectoryFileEntry(devicePath);
       logDebug(debug, "Pulling screenshots from [%s] %s", serial, devicePath);
 
-      device.getSyncService().pull(new FileEntry[] {deviceDir}, localDirName, QUIET_MONITOR);
+      device.getSyncService().pull(new FileEntry[] { deviceDir }, localDirName, QUIET_MONITOR);
 
       File screenshotDir = new File(work, dirName);
       if (screenshotDir.exists()) {
-        File imageDir = FileUtils.getFile(output, "image", serial);
-        imageDir.mkdirs();
 
         // Move all children of the screenshot directory into the image folder.
         File[] classNameDirs = screenshotDir.listFiles();
         if (classNameDirs != null) {
-          Multimap<DeviceTest, File> screenshots = ArrayListMultimap.create();
           for (File classNameDir : classNameDirs) {
             String className = classNameDir.getName();
             File destDir = new File(imageDir, className);
@@ -236,7 +270,8 @@ public final class SpoonDeviceRunner {
           for (DeviceTest deviceTest : screenshots.keySet()) {
             List<File> testScreenshots = new ArrayList<File>(screenshots.get(deviceTest));
             if (testScreenshots.size() == 1) {
-              continue; // Do not make an animated GIF if there is only one screenshot.
+              continue; // Do not make an animated GIF if there is only one
+                        // screenshot.
             }
             Collections.sort(testScreenshots);
             File animatedGif = FileUtils.getFile(imageDir, deviceTest.getClassName(),
@@ -270,11 +305,13 @@ public final class SpoonDeviceRunner {
     }
   }
 
-  /////////////////////////////////////////////////////////////////////////////
-  ////  Secondary Per-Device Process  /////////////////////////////////////////
-  /////////////////////////////////////////////////////////////////////////////
+  // ///////////////////////////////////////////////////////////////////////////
+  // // Secondary Per-Device Process /////////////////////////////////////////
+  // ///////////////////////////////////////////////////////////////////////////
 
-  /** Deserialize ourselves from disk, run the tests, and serialize the result back to disk. */
+  /**
+   * Deserialize ourselves from disk, run the tests, and serialize the result back to disk.
+   */
   public static void main(String... args) {
     if (args.length != 1) {
       throw new IllegalArgumentException("Must be started with a device directory.");

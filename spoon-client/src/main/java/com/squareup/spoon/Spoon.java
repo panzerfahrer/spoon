@@ -1,5 +1,20 @@
 package com.squareup.spoon;
 
+import static android.content.Context.MODE_WORLD_READABLE;
+import static android.graphics.Bitmap.CompressFormat.PNG;
+import static android.graphics.Bitmap.Config.ARGB_8888;
+import static com.squareup.spoon.Chmod.chmodPlusR;
+import static com.squareup.spoon.Chmod.chmodPlusRWX;
+
+import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
+
 import android.app.Activity;
 import android.content.Context;
 import android.graphics.Bitmap;
@@ -7,19 +22,6 @@ import android.graphics.Canvas;
 import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.util.Log;
-import java.io.BufferedOutputStream;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.OutputStream;
-import java.util.concurrent.CountDownLatch;
-import java.util.regex.Pattern;
-
-import static android.content.Context.MODE_WORLD_READABLE;
-import static android.graphics.Bitmap.CompressFormat.PNG;
-import static android.graphics.Bitmap.Config.ARGB_8888;
-import static com.squareup.spoon.Chmod.chmodPlusR;
-import static com.squareup.spoon.Chmod.chmodPlusRWX;
 
 /** Utility class for capturing screenshots for Spoon. */
 public final class Spoon {
@@ -32,12 +34,80 @@ public final class Spoon {
   private static final Object LOCK = new Object();
   private static final Pattern TAG_VALIDATION = Pattern.compile("[a-zA-Z0-9_-]+");
 
+  private static final int MAX_SCREENSHOT_WAIT = 5000;
+
   /** Whether or not the screenshot output directory needs cleared. */
   private static boolean outputNeedsClear = true;
 
   /**
+   * Let DDMS take a screenshot with the specified tag.
+   * 
+   * @param activity Activity with which to capture a screenshot.
+   * @param tag Unique tag to further identify the screenshot. Must match [a-zA-Z0-9_-]+.
+   */
+  public static void screenshotDDMS(Activity activity, String tag) {
+    screenshotDDMS(activity, tag, MAX_SCREENSHOT_WAIT);
+  }
+
+  /**
+   * Let DDMS take a screenshot with the specified tag.
+   * 
+   * @param activity Activity with which to capture a screenshot.
+   * @param tag Unique tag to further identify the screenshot. Must match [a-zA-Z0-9_-]+.
+   * @param timeout time to wait for DDMS to finish taking the screenshot
+   */
+  public static void screenshotDDMS(Activity activity, String tag, long timeout) {
+    if (!TAG_VALIDATION.matcher(tag).matches()) {
+      throw new IllegalArgumentException("Tag must match " + TAG_VALIDATION.pattern() + ".");
+    }
+    try {
+      File screenshotDirectory = obtainScreenshotDirectory(activity);
+      String screenshotName = System.currentTimeMillis() + NAME_SEPARATOR + tag + EXTENSION;
+      screenshotDirectory.mkdirs();
+
+      final File file = new File(screenshotDirectory, screenshotName);
+      file.createNewFile();
+      Chmod.chmodPlusRWX(file);
+
+      // requesting android-screenshot-paparazzo to take a screenshot
+      String args = String.format("{file=%s}", file.getAbsolutePath());
+
+      Log.i("screenshot_request", args);
+      waitForDddmsScreenshot(file, timeout);
+
+    } catch (Exception e) {
+      throw new RuntimeException("Unable to capture screenshot.", e);
+    }
+  }
+
+  private static void waitForDddmsScreenshot(final File file, final long timeout) {
+    final long startTime = System.currentTimeMillis();
+    final long maxWaitUntil = startTime + timeout;
+
+    final CountDownLatch done = new CountDownLatch(1);
+    while (true) {
+      if (maxWaitUntil < System.currentTimeMillis()) {
+        file.delete();
+        throw new RuntimeException("Waited too long for screenshot.");
+      }
+
+      if (!file.exists()) {
+        done.countDown();
+        break;
+      }
+
+      Log.i(TAG, "Waiting for screenshot ...");
+
+      try {
+        done.await(500, TimeUnit.MILLISECONDS);
+      } catch (InterruptedException e) {
+      }
+    }
+  }
+
+  /**
    * Take a screenshot with the specified tag.
-   *
+   * 
    * @param activity Activity with which to capture a screenshot.
    * @param tag Unique tag to further identify the screenshot. Must match [a-zA-Z0-9_-]+.
    */
@@ -65,7 +135,8 @@ public final class Spoon {
       // On a background thread, post to main.
       final CountDownLatch latch = new CountDownLatch(1);
       activity.runOnUiThread(new Runnable() {
-        @Override public void run() {
+        @Override
+        public void run() {
           try {
             drawDecorViewToBitmap(activity, bitmap);
           } finally {
@@ -119,7 +190,9 @@ public final class Spoon {
     return dirMethod;
   }
 
-  /** Returns the test class element by looking at the method InstrumentationTestCase invokes. */
+  /**
+   * Returns the test class element by looking at the method InstrumentationTestCase invokes.
+   */
   static StackTraceElement findTestClassTraceElement(StackTraceElement[] trace) {
     for (int i = trace.length - 1; i >= 0; i--) {
       StackTraceElement element = trace[i];
