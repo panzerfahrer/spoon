@@ -63,7 +63,7 @@ public class SpoonScreenshotProcessor implements ScreenshotProcessor, IShellOutp
 
       ImageIO.write(image, "png", screenshot);
 
-      // make sure the file actually gets a newer timestamp
+      // delete file on remote device
       String cmd = String.format("rm %s", remoteFilePath);
       logInfo("executing on device: %s", cmd);
       device.executeShellCommand(cmd, this);
