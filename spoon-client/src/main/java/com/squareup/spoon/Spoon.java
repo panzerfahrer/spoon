@@ -73,14 +73,14 @@ public final class Spoon {
       String args = String.format("{file=%s}", file.getAbsolutePath());
 
       Log.i("screenshot_request", args);
-      waitForDddmsScreenshot(file, timeout);
+      waitForDdmsScreenshot(file, timeout);
 
     } catch (Exception e) {
       throw new RuntimeException("Unable to capture screenshot.", e);
     }
   }
 
-  private static void waitForDddmsScreenshot(final File file, final long timeout) {
+  private static void waitForDdmsScreenshot(final File file, final long timeout) {
     final long startTime = System.currentTimeMillis();
     final long maxWaitUntil = startTime + timeout;
 
