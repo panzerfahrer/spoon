@@ -182,9 +182,8 @@ public final class SpoonDeviceRunner {
     final String devicePath = "/data/data/" + appPackage + "/" + dirName;
     Multimap<DeviceTest, File> screenshots = ArrayListMultimap.create();
 
-    SpoonScreenshotProcessor screenshotProcessor = new SpoonScreenshotProcessor(device, imageDir);
-    SpoonScreenshotService screenshotService = new SpoonScreenshotService(device,
-        screenshotProcessor);
+    SpoonScreenshotProcessor shotProcessor = new SpoonScreenshotProcessor(device, imageDir);
+    SpoonScreenshotService screenshotService = new SpoonScreenshotService(device, shotProcessor);
 
     // Initiate device logging.
     SpoonDeviceLogger deviceLogger = new SpoonDeviceLogger(device);
@@ -219,7 +218,7 @@ public final class SpoonDeviceRunner {
     }
 
     // Grab all screenshots taken via DDMS
-    Multimap<DeviceTest, File> ddmsScreenshots = screenshotProcessor.getScreenshots();
+    Multimap<DeviceTest, File> ddmsScreenshots = shotProcessor.getScreenshots();
     for (Entry<DeviceTest, File> entry : ddmsScreenshots.entries()) {
       DeviceTest testIdentifier = entry.getKey();
       DeviceTestResult.Builder builder = result.getMethodResultBuilder(testIdentifier);

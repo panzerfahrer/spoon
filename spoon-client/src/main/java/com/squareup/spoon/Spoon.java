@@ -34,7 +34,7 @@ public final class Spoon {
   private static final Object LOCK = new Object();
   private static final Pattern TAG_VALIDATION = Pattern.compile("[a-zA-Z0-9_-]+");
 
-  private static final int MAX_SCREENSHOT_WAIT = 5000;
+  private static final int MAX_SCREENSHOT_WAIT = 10000;
 
   /** Whether or not the screenshot output directory needs cleared. */
   private static boolean outputNeedsClear = true;
@@ -56,10 +56,11 @@ public final class Spoon {
    * @param tag Unique tag to further identify the screenshot. Must match [a-zA-Z0-9_-]+.
    * @param timeout time to wait for DDMS to finish taking the screenshot
    */
-  public static void screenshotDDMS(Activity activity, String tag, long timeout) {
+  public static void screenshotDDMS(Activity activity, String tag, final long timeout) {
     if (!TAG_VALIDATION.matcher(tag).matches()) {
       throw new IllegalArgumentException("Tag must match " + TAG_VALIDATION.pattern() + ".");
     }
+    
     try {
       File screenshotDirectory = obtainScreenshotDirectory(activity);
       String screenshotName = System.currentTimeMillis() + NAME_SEPARATOR + tag + EXTENSION;
@@ -70,10 +71,20 @@ public final class Spoon {
       Chmod.chmodPlusRWX(file);
 
       // requesting android-screenshot-paparazzo to take a screenshot
-      String args = String.format("{file=%s}", file.getAbsolutePath());
+      final String args = String.format("{file=%s}", file.getAbsolutePath());
 
-      Log.i("screenshot_request", args);
-      waitForDdmsScreenshot(file, timeout);
+      if (Looper.myLooper() == Looper.getMainLooper()) {
+        Log.i("screenshot_request", args);
+        waitForDdmsScreenshot(file, timeout);
+      } else {
+        activity.runOnUiThread(new Runnable() {
+          @Override
+          public void run() {
+            Log.i("screenshot_request", args);
+            waitForDdmsScreenshot(file, timeout);
+          }
+        });
+      }
 
     } catch (Exception e) {
       throw new RuntimeException("Unable to capture screenshot.", e);
