@@ -16,12 +16,19 @@ import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
 import android.app.Activity;
+import android.app.Instrumentation;
 import android.content.Context;
+import android.content.pm.ActivityInfo;
+import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
+import android.os.Build;
 import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.util.Log;
+import android.view.Display;
+import android.view.Surface;
+import android.view.WindowManager;
 
 /** Utility class for capturing screenshots for Spoon. */
 public final class Spoon {
@@ -42,25 +49,27 @@ public final class Spoon {
   /**
    * Let DDMS take a screenshot with the specified tag.
    * 
-   * @param activity Activity with which to capture a screenshot.
+   * @param instrumentation The {@link Instrumentation} instance of the currently running test case.
    * @param tag Unique tag to further identify the screenshot. Must match [a-zA-Z0-9_-]+.
    */
-  public static void screenshotDDMS(Activity activity, String tag) {
-    screenshotDDMS(activity, tag, MAX_SCREENSHOT_WAIT);
+  public static void screenshotDDMS(Instrumentation instrumentation, String tag) {
+    screenshotDDMS(instrumentation, tag, MAX_SCREENSHOT_WAIT);
   }
 
   /**
    * Let DDMS take a screenshot with the specified tag.
    * 
-   * @param activity Activity with which to capture a screenshot.
+   * @param instrumentation The {@link Instrumentation} instance of the currently running test case.
    * @param tag Unique tag to further identify the screenshot. Must match [a-zA-Z0-9_-]+.
    * @param timeout time to wait for DDMS to finish taking the screenshot
    */
-  public static void screenshotDDMS(Activity activity, String tag, final long timeout) {
+  public static void screenshotDDMS(Instrumentation instrumentation, String tag, final long timeout) {
     if (!TAG_VALIDATION.matcher(tag).matches()) {
       throw new IllegalArgumentException("Tag must match " + TAG_VALIDATION.pattern() + ".");
     }
-    
+
+    final Context activity = instrumentation.getTargetContext();
+
     try {
       File screenshotDirectory = obtainScreenshotDirectory(activity);
       String screenshotName = System.currentTimeMillis() + NAME_SEPARATOR + tag + EXTENSION;
@@ -70,25 +79,60 @@ public final class Spoon {
       file.createNewFile();
       Chmod.chmodPlusRWX(file);
 
-      // requesting android-screenshot-paparazzo to take a screenshot
-      final String args = String.format("{file=%s}", file.getAbsolutePath());
+      int deviceOrientation = getDeviceOrientation(activity);
 
-      if (Looper.myLooper() == Looper.getMainLooper()) {
-        Log.i("screenshot_request", args);
-        waitForDdmsScreenshot(file, timeout);
-      } else {
-        activity.runOnUiThread(new Runnable() {
-          @Override
-          public void run() {
-            Log.i("screenshot_request", args);
-            waitForDdmsScreenshot(file, timeout);
-          }
-        });
-      }
+      // requesting android-screenshot-paparazzo to take a screenshot
+      final String args = String.format("{file=%s,orientation=%d}", file.getAbsolutePath(),
+          deviceOrientation);
+      Log.i("screenshot_request", args);
+
+      instrumentation.runOnMainSync(new Runnable() {
+        @Override
+        public void run() {
+          waitForDdmsScreenshot(file, timeout);
+        }
+      });
 
     } catch (Exception e) {
       throw new RuntimeException("Unable to capture screenshot.", e);
     }
+  }
+
+  private static int getDeviceOrientation(Context context) {
+
+    final WindowManager wm = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
+    final Display defaultDisplay = wm.getDefaultDisplay();
+    final int rotation = defaultDisplay.getRotation();
+    final int orientation = defaultDisplay.getOrientation();
+
+    // Copied from Android docs, since we don't have these values in Froyo 2.2
+    int SCREEN_ORIENTATION_REVERSE_LANDSCAPE = 8;
+    int SCREEN_ORIENTATION_REVERSE_PORTRAIT = 9;
+
+    if (Build.VERSION.SDK_INT <= 8 /* Build.VERSION_CODES.FROYO */) {
+      SCREEN_ORIENTATION_REVERSE_LANDSCAPE = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE;
+      SCREEN_ORIENTATION_REVERSE_PORTRAIT = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+    }
+
+    switch (orientation) {
+    case Configuration.ORIENTATION_PORTRAIT:
+      if (rotation == Surface.ROTATION_0 || rotation == Surface.ROTATION_90) {
+        return ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+      } else {
+        return SCREEN_ORIENTATION_REVERSE_PORTRAIT;
+      }
+
+    case Configuration.ORIENTATION_LANDSCAPE:
+      if (rotation == Surface.ROTATION_0 || rotation == Surface.ROTATION_90) {
+        return ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE;
+      } else {
+        return SCREEN_ORIENTATION_REVERSE_LANDSCAPE;
+      }
+
+    default:
+      return ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+    }
+
   }
 
   private static void waitForDdmsScreenshot(final File file, final long timeout) {
