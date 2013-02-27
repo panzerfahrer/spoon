@@ -225,8 +225,10 @@ public final class SpoonDeviceRunner {
 
       if (builder != null) {
         File screenshot = entry.getValue();
-        builder.addScreenshot(screenshot);
-        screenshots.put(testIdentifier, screenshot);
+        builder.addScreenshotIfNotExists(screenshot);
+        if (!screenshots.get(testIdentifier).contains(screenshot)) {
+          screenshots.put(testIdentifier, screenshot);
+        }
       }
     }
 
@@ -257,8 +259,10 @@ public final class SpoonDeviceRunner {
               DeviceTest testIdentifier = new DeviceTest(className, methodName);
               DeviceTestResult.Builder builder = result.getMethodResultBuilder(testIdentifier);
               if (builder != null) {
-                builder.addScreenshot(screenshot);
-                screenshots.put(testIdentifier, screenshot);
+                builder.addScreenshotIfNotExists(screenshot);
+                if (!screenshots.get(testIdentifier).contains(screenshot)) {
+                  screenshots.put(testIdentifier, screenshot);
+                }
               } else {
                 logError("Unable to find test for %s", testIdentifier);
               }
@@ -279,6 +283,7 @@ public final class SpoonDeviceRunner {
             result.getMethodResultBuilder(deviceTest).setAnimatedGif(animatedGif);
           }
         }
+
         try {
           FileUtils.deleteDirectory(screenshotDir);
         } catch (IOException ignored) {

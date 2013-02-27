@@ -116,6 +116,14 @@ public final class DeviceTestResult {
       return this;
     }
 
+    public Builder addScreenshotIfNotExists(File screenshot) {
+      checkNotNull(screenshot);
+      if (!screenshots.contains(screenshot)) {
+        screenshots.add(screenshot);
+      }
+      return this;
+    }
+
     public Builder setAnimatedGif(File animatedGif) {
       checkNotNull(animatedGif);
       checkArgument(this.animatedGif == null, "Animated GIF already set.");
