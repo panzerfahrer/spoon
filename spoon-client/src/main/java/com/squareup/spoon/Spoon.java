@@ -16,12 +16,23 @@ import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
 import android.app.Activity;
+import android.app.Instrumentation;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.pm.ActivityInfo;
+import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
+import android.os.Build;
+import android.os.Handler;
 import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.util.Log;
+import android.view.Display;
+import android.view.Surface;
+import android.view.WindowManager;
 
 /** Utility class for capturing screenshots for Spoon. */
 public final class Spoon {
@@ -39,14 +50,75 @@ public final class Spoon {
   /** Whether or not the screenshot output directory needs cleared. */
   private static boolean outputNeedsClear = true;
 
+  private static class ScreenshotReceiver extends BroadcastReceiver {
+
+    static final String EXTRA_FILE = "com.squareup.spoon.ScreenshotTaken.File";
+    static final String EXTRA_SUCCESS = "com.squareup.spoon.ScreenshotTaken.Success";
+    static final IntentFilter FILTER = new IntentFilter();
+
+    static {
+      FILTER.addAction("com.squareup.spoon.ScreenshotTaken");
+    }
+
+    private final CountDownLatch latch;
+    private final String filePath;
+
+    public boolean received;
+    public boolean success;
+
+    public ScreenshotReceiver(final CountDownLatch latch, final String filePath) {
+      super();
+      this.latch = latch;
+      this.filePath = filePath;
+    }
+    
+    @Override
+    public void onReceive(Context context, Intent intent) {
+      final String action = intent.getAction();
+
+      Log.i(TAG, "receiving " + action);
+
+      if (FILTER.hasAction(action) && this.filePath.equals(intent.getStringExtra(EXTRA_FILE))) {
+        this.success = intent.getBooleanExtra(EXTRA_SUCCESS, false);
+        this.received = true;
+        this.latch.countDown();
+      }
+    }
+  }
+
+  private static class ScreenshotThread extends Thread {
+
+    private boolean isFinished;
+    public Handler handler;
+
+    public ScreenshotThread() {
+      super("ScreenshotThread");
+    }
+    
+    @Override
+    public void run() {
+      Looper.prepare();
+      this.handler = new Handler(Looper.myLooper());
+      
+      while (!isFinished) {
+        Looper.loop();
+      }
+    }
+
+    public void finish() {
+      this.isFinished = true;
+    }
+
+  }
+
   /**
    * Let DDMS take a screenshot with the specified tag.
    * 
    * @param activity Activity with which to capture a screenshot.
    * @param tag Unique tag to further identify the screenshot. Must match [a-zA-Z0-9_-]+.
    */
-  public static void screenshotDDMS(Activity activity, String tag) {
-    screenshotDDMS(activity, tag, MAX_SCREENSHOT_WAIT);
+  public static void screenshotDDMS(Instrumentation instrumentation, String tag) {
+    screenshotDDMS(instrumentation, tag, MAX_SCREENSHOT_WAIT);
   }
 
   /**
@@ -56,34 +128,45 @@ public final class Spoon {
    * @param tag Unique tag to further identify the screenshot. Must match [a-zA-Z0-9_-]+.
    * @param timeout time to wait for DDMS to finish taking the screenshot
    */
-  public static void screenshotDDMS(Activity activity, String tag, final long timeout) {
+  public static void screenshotDDMS(Instrumentation instrumentation, String tag, final long timeout) {
     if (!TAG_VALIDATION.matcher(tag).matches()) {
       throw new IllegalArgumentException("Tag must match " + TAG_VALIDATION.pattern() + ".");
     }
-    
-    try {
-      File screenshotDirectory = obtainScreenshotDirectory(activity);
-      String screenshotName = System.currentTimeMillis() + NAME_SEPARATOR + tag + EXTENSION;
-      screenshotDirectory.mkdirs();
 
-      final File file = new File(screenshotDirectory, screenshotName);
-      file.createNewFile();
-      Chmod.chmodPlusRWX(file);
+    final Context activity = instrumentation.getTargetContext();
+
+    try {
+      final File screenshotDirectory = obtainScreenshotDirectory(activity);
+      final String screenshotName = System.currentTimeMillis() + NAME_SEPARATOR + tag + EXTENSION;
+      final String filePath = new File(screenshotDirectory, screenshotName).getAbsolutePath();
+
+      // set up broadcast receiver to listen for results
+      final CountDownLatch done = new CountDownLatch(1);
+      final ScreenshotThread screenshotThread = new ScreenshotThread();
+      screenshotThread.start();
+
+      ScreenshotReceiver shotReceiver = new ScreenshotReceiver(done, filePath);
+      activity.getApplicationContext().registerReceiver(shotReceiver, ScreenshotReceiver.FILTER,
+          null, screenshotThread.handler);
+
+      int deviceOrientation = getDeviceOrientation(activity);
 
       // requesting android-screenshot-paparazzo to take a screenshot
-      final String args = String.format("{file=%s}", file.getAbsolutePath());
+      final String args = String.format("{file=%s,orientation=%d}", filePath, deviceOrientation);
+      Log.i("screenshot_request", args);
 
-      if (Looper.myLooper() == Looper.getMainLooper()) {
-        Log.i("screenshot_request", args);
-        waitForDdmsScreenshot(file, timeout);
-      } else {
-        activity.runOnUiThread(new Runnable() {
-          @Override
-          public void run() {
-            Log.i("screenshot_request", args);
-            waitForDdmsScreenshot(file, timeout);
-          }
-        });
+      instrumentation.runOnMainSync(new Runnable() {
+        @Override
+        public void run() {
+          waitForDdmsScreenshot(done, timeout);
+        }
+      });
+      
+      screenshotThread.finish();
+      activity.getApplicationContext().unregisterReceiver(shotReceiver);
+
+      if (!shotReceiver.success || !shotReceiver.received) {
+        throw new RuntimeException("Taking screenshot failed.");
       }
 
     } catch (Exception e) {
@@ -91,29 +174,61 @@ public final class Spoon {
     }
   }
 
-  private static void waitForDdmsScreenshot(final File file, final long timeout) {
+  private static void waitForDdmsScreenshot(final CountDownLatch done, final long timeout) {
     final long startTime = System.currentTimeMillis();
     final long maxWaitUntil = startTime + timeout;
 
-    final CountDownLatch done = new CountDownLatch(1);
-    while (true) {
-      if (maxWaitUntil < System.currentTimeMillis()) {
-        file.delete();
-        throw new RuntimeException("Waited too long for screenshot.");
-      }
-
-      if (!file.exists()) {
-        done.countDown();
-        break;
-      }
-
-      Log.i(TAG, "Waiting for screenshot ...");
+    while (maxWaitUntil > System.currentTimeMillis()) {
+      long timeToWait = maxWaitUntil - System.currentTimeMillis();
+      Log.i(TAG, String.format("Waiting %dms for screenshot on thread %s ...", timeToWait, Thread
+          .currentThread().getName()));
 
       try {
         done.await(500, TimeUnit.MILLISECONDS);
+        Thread.yield();
       } catch (InterruptedException e) {
+        Log.w(TAG, e);
       }
     }
+
+    Log.i(TAG, String.format("... waited %dms", System.currentTimeMillis() - startTime));
+  }
+
+  private static int getDeviceOrientation(Context context) {
+
+    final WindowManager wm = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
+    final Display defaultDisplay = wm.getDefaultDisplay();
+    final int rotation = defaultDisplay.getRotation();
+    final int orientation = defaultDisplay.getOrientation();
+
+    // Copied from Android docs, since we don't have these values in Froyo 2.2
+    int SCREEN_ORIENTATION_REVERSE_LANDSCAPE = 8;
+    int SCREEN_ORIENTATION_REVERSE_PORTRAIT = 9;
+
+    if (Build.VERSION.SDK_INT <= 8 /* Build.VERSION_CODES.FROYO */) {
+      SCREEN_ORIENTATION_REVERSE_LANDSCAPE = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE;
+      SCREEN_ORIENTATION_REVERSE_PORTRAIT = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+    }
+
+    switch (orientation) {
+    case Configuration.ORIENTATION_PORTRAIT:
+      if (rotation == Surface.ROTATION_0 || rotation == Surface.ROTATION_90) {
+        return ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+      } else {
+        return SCREEN_ORIENTATION_REVERSE_PORTRAIT;
+      }
+
+    case Configuration.ORIENTATION_LANDSCAPE:
+      if (rotation == Surface.ROTATION_0 || rotation == Surface.ROTATION_90) {
+        return ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE;
+      } else {
+        return SCREEN_ORIENTATION_REVERSE_LANDSCAPE;
+      }
+
+    default:
+      return ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+    }
+
   }
 
   /**

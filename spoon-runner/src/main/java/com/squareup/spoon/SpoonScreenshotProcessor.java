@@ -3,6 +3,8 @@ package com.squareup.spoon;
 import static com.squareup.spoon.SpoonLogger.logError;
 import static com.squareup.spoon.SpoonLogger.logInfo;
 
+import java.awt.geom.AffineTransform;
+import java.awt.image.AffineTransformOp;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
@@ -29,6 +31,11 @@ import com.google.common.collect.Multimap;
  */
 public class SpoonScreenshotProcessor implements ScreenshotProcessor, IShellOutputReceiver {
 
+  private static final int SCREEN_ORIENTATION_LANDSCAPE = 0;
+  private static final int SCREEN_ORIENTATION_PORTRAIT = 1;
+  private static final int SCREEN_ORIENTATION_REVERSE_LANDSCAPE = 8;
+  private static final int SCREEN_ORIENTATION_REVERSE_PORTRAIT = 9;
+
   private final IDevice device;
   private final File outputDir;
   private final Multimap<DeviceTest, File> screenshotMap;
@@ -50,6 +57,8 @@ public class SpoonScreenshotProcessor implements ScreenshotProcessor, IShellOutp
   public void process(BufferedImage image, Map<String, String> requestData) {
     logInfo("processing screenshot");
 
+    final int deviceOrientation = Integer.valueOf(requestData.get("orientation")).intValue();
+
     final String remoteFilePath = requestData.get("file");
     File remoteFile = new File(remoteFilePath);
 
@@ -57,29 +66,77 @@ public class SpoonScreenshotProcessor implements ScreenshotProcessor, IShellOutp
     String className = remoteFile.getParentFile().getParentFile().getName();
 
     try {
+      rotateScreenshot(image, deviceOrientation);
+      
       File screenshot = FileUtils.getFile(outputDir, className, methodName, remoteFile.getName());
       screenshot.getParentFile().mkdirs();
       screenshot.createNewFile();
 
       ImageIO.write(image, "png", screenshot);
 
-      // make sure the file actually gets a newer timestamp
-      String cmd = String.format("rm %s", remoteFilePath);
-      logInfo("executing on device: %s", cmd);
-      device.executeShellCommand(cmd, this);
+      // broadcast that we're finished
+      broadcastFinished(remoteFilePath, true);
 
       // Add screenshot to appropriate method result.
       DeviceTest testIdentifier = new DeviceTest(className, methodName);
       screenshotMap.put(testIdentifier, screenshot);
 
     } catch (IOException e) {
+      broadcastFinished(remoteFilePath, false);
       logError("Couldn't write screenshot file: %s", e);
+    }
+
+  }
+
+  private void broadcastFinished(final String remoteFilePath, final boolean success) {
+    StringBuilder cmd = new StringBuilder();
+    cmd.append("am broadcast");
+    cmd.append(" -a com.squareup.spoon.ScreenshotTaken");
+    cmd.append(" --es com.squareup.spoon.ScreenshotTaken.File ");
+    cmd.append(remoteFilePath);
+    cmd.append(" --ez com.squareup.spoon.ScreenshotTaken.Success ");
+    cmd.append(success);
+
+    logInfo("executing on device: %s", cmd);
+
+    try {
+      device.executeShellCommand(cmd.toString(), this);
+      // TODO how to handle exceptions here? retry?
     } catch (TimeoutException e) {
-      logError("Couldn't delete temp-screenshot file on the device: %s", e);
     } catch (AdbCommandRejectedException e) {
-      logError("Couldn't delete temp-screenshot file on the device: %s", e);
     } catch (ShellCommandUnresponsiveException e) {
-      logError("Couldn't delete temp-screenshot file on the device: %s", e);
+    } catch (IOException e) {
+    }
+  }
+
+  private void rotateScreenshot(BufferedImage image, int orienation) {
+    int quadrantNum = 0;
+
+    switch (orienation) {
+    case SCREEN_ORIENTATION_PORTRAIT:
+      quadrantNum = 0;
+      break;
+
+    case SCREEN_ORIENTATION_LANDSCAPE:
+      if (image.getHeight() < image.getWidth()) {
+        quadrantNum = 3;
+      }
+      break;
+
+    case SCREEN_ORIENTATION_REVERSE_PORTRAIT:
+      quadrantNum = 2;
+      break;
+
+    case SCREEN_ORIENTATION_REVERSE_LANDSCAPE:
+      quadrantNum = 1;
+      break;
+
+    }
+
+    if (quadrantNum > 0) {
+      AffineTransform transform = AffineTransform.getQuadrantRotateInstance(quadrantNum);
+      AffineTransformOp op = new AffineTransformOp(transform, AffineTransformOp.TYPE_BILINEAR);
+      image = op.filter(image, null);
     }
 
   }
@@ -97,7 +154,7 @@ public class SpoonScreenshotProcessor implements ScreenshotProcessor, IShellOutp
 
   @Override
   public void addOutput(byte[] data, int offset, int length) {
-    logInfo("shell response from delete: %s", new String(data));
+    logInfo("shell response: %s", new String(data));
   }
 
   @Override
