@@ -31,10 +31,8 @@ import com.android.ddmlib.FileListingService.FileEntry;
 import com.android.ddmlib.IDevice;
 import com.android.ddmlib.InstallException;
 import com.android.ddmlib.testrunner.RemoteAndroidTestRunner;
-import com.github.rtyley.android.screenshot.paparazzo.processors.ScreenshotProcessor;
 import com.google.common.base.Strings;
 import com.google.common.collect.ArrayListMultimap;
-import com.google.common.collect.Collections2;
 import com.google.common.collect.Multimap;
 
 /** Represents a single device and the test configuration to be executed. */
@@ -183,7 +181,7 @@ public final class SpoonDeviceRunner {
     Multimap<DeviceTest, File> screenshots = ArrayListMultimap.create();
 
     SpoonScreenshotProcessor shotProcessor = new SpoonScreenshotProcessor(device, imageDir);
-    SpoonScreenshotService screenshotService = new SpoonScreenshotService(device, shotProcessor);
+    SpoonScreenshotClient screenshotClient = new SpoonScreenshotClient(device, shotProcessor);
 
     // Initiate device logging.
     SpoonDeviceLogger deviceLogger = new SpoonDeviceLogger(device);
@@ -201,9 +199,10 @@ public final class SpoonDeviceRunner {
           runner.setMethodName(className, methodName);
         }
       }
-      screenshotService.start();
+      
+      new Thread(screenshotClient).start();
       runner.run(new SpoonTestRunListener(result, debug));
-      screenshotService.finish();
+      screenshotClient.finish();
     } catch (Exception e) {
       result.addException(e);
     }

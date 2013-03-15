@@ -16,27 +16,24 @@ import org.apache.commons.io.FileUtils;
 
 import com.android.ddmlib.AdbCommandRejectedException;
 import com.android.ddmlib.IDevice;
-import com.android.ddmlib.IShellOutputReceiver;
 import com.android.ddmlib.ShellCommandUnresponsiveException;
 import com.android.ddmlib.TimeoutException;
-import com.github.rtyley.android.screenshot.paparazzo.processors.ScreenshotProcessor;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Multimap;
 
 /**
- * Processes screenshots taken by {@link SpoonScreenshotService}.
+ * Processes screenshots taken by {@link SpoonScreenshotClient}.
  * 
  * @author brho
  * 
  */
-public class SpoonScreenshotProcessor implements ScreenshotProcessor, IShellOutputReceiver {
+public class SpoonScreenshotProcessor implements ScreenshotProcessor {
 
   private static final int SCREEN_ORIENTATION_LANDSCAPE = 0;
   private static final int SCREEN_ORIENTATION_PORTRAIT = 1;
   private static final int SCREEN_ORIENTATION_REVERSE_LANDSCAPE = 8;
   private static final int SCREEN_ORIENTATION_REVERSE_PORTRAIT = 9;
 
-  private final IDevice device;
   private final File outputDir;
   private final Multimap<DeviceTest, File> screenshotMap;
 
@@ -48,68 +45,39 @@ public class SpoonScreenshotProcessor implements ScreenshotProcessor, IShellOutp
    *          to
    */
   public SpoonScreenshotProcessor(IDevice device, File output) {
-    this.device = device;
     this.outputDir = output;
     this.screenshotMap = HashMultimap.create();
   }
 
   @Override
-  public void process(BufferedImage image, Map<String, String> requestData) {
+  public void process(BufferedImage image, Map<String, Object> requestData) {
     logInfo("processing screenshot");
 
-    final int deviceOrientation = Integer.valueOf(requestData.get("orientation")).intValue();
-
-    final String remoteFilePath = requestData.get("file");
-    File remoteFile = new File(remoteFilePath);
-
-    String methodName = remoteFile.getParentFile().getName();
-    String className = remoteFile.getParentFile().getParentFile().getName();
+    int deviceOrientation = ((Integer) requestData.get(SpoonScreenshotClient.ARG_ORIENTATION)).intValue();
+    String screenshotName = (String) requestData.get(SpoonScreenshotClient.ARG_SCREENSHOT_NAME);
+    String methodName = (String) requestData.get(SpoonScreenshotClient.ARG_METHODNAME);
+    String className = (String) requestData.get(SpoonScreenshotClient.ARG_METHODNAME);
 
     try {
-      rotateScreenshot(image, deviceOrientation);
-      
-      File screenshot = FileUtils.getFile(outputDir, className, methodName, remoteFile.getName());
+      image = rotateScreenshot(image, deviceOrientation);
+
+      File screenshot = FileUtils.getFile(outputDir, className, methodName, screenshotName);
       screenshot.getParentFile().mkdirs();
       screenshot.createNewFile();
 
       ImageIO.write(image, "png", screenshot);
-
-      // broadcast that we're finished
-      broadcastFinished(remoteFilePath, true);
 
       // Add screenshot to appropriate method result.
       DeviceTest testIdentifier = new DeviceTest(className, methodName);
       screenshotMap.put(testIdentifier, screenshot);
 
     } catch (IOException e) {
-      broadcastFinished(remoteFilePath, false);
       logError("Couldn't write screenshot file: %s", e);
     }
 
   }
 
-  private void broadcastFinished(final String remoteFilePath, final boolean success) {
-    StringBuilder cmd = new StringBuilder();
-    cmd.append("am broadcast");
-    cmd.append(" -a com.squareup.spoon.ScreenshotTaken");
-    cmd.append(" --es com.squareup.spoon.ScreenshotTaken.File ");
-    cmd.append(remoteFilePath);
-    cmd.append(" --ez com.squareup.spoon.ScreenshotTaken.Success ");
-    cmd.append(success);
-
-    logInfo("executing on device: %s", cmd);
-
-    try {
-      device.executeShellCommand(cmd.toString(), this);
-      // TODO how to handle exceptions here? retry?
-    } catch (TimeoutException e) {
-    } catch (AdbCommandRejectedException e) {
-    } catch (ShellCommandUnresponsiveException e) {
-    } catch (IOException e) {
-    }
-  }
-
-  private void rotateScreenshot(BufferedImage image, int orienation) {
+  private BufferedImage rotateScreenshot(BufferedImage image, int orienation) {
     int quadrantNum = 0;
 
     switch (orienation) {
@@ -136,9 +104,10 @@ public class SpoonScreenshotProcessor implements ScreenshotProcessor, IShellOutp
     if (quadrantNum > 0) {
       AffineTransform transform = AffineTransform.getQuadrantRotateInstance(quadrantNum);
       AffineTransformOp op = new AffineTransformOp(transform, AffineTransformOp.TYPE_BILINEAR);
-      image = op.filter(image, null);
+      return op.filter(image, null);
     }
 
+    return image;
   }
 
   /**
@@ -146,24 +115,6 @@ public class SpoonScreenshotProcessor implements ScreenshotProcessor, IShellOutp
    */
   public Multimap<DeviceTest, File> getScreenshots() {
     return this.screenshotMap;
-  }
-
-  @Override
-  public void finish() {
-  }
-
-  @Override
-  public void addOutput(byte[] data, int offset, int length) {
-    logInfo("shell response: %s", new String(data));
-  }
-
-  @Override
-  public void flush() {
-  }
-
-  @Override
-  public boolean isCancelled() {
-    return false;
   }
 
 }

@@ -71,11 +71,6 @@
       <artifactId>mockito-core</artifactId>
       <scope>test</scope>
     </dependency>
-    <dependency>
-    	<groupId>com.github.rtyley</groupId>
-    	<artifactId>android-screenshot-paparazzo</artifactId>
-    	<version>1.8</version>
-    </dependency>
   </dependencies>
 
   <build>

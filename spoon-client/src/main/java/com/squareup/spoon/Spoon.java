@@ -7,10 +7,20 @@ import static com.squareup.spoon.Chmod.chmodPlusR;
 import static com.squareup.spoon.Chmod.chmodPlusRWX;
 
 import java.io.BufferedOutputStream;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
+import java.io.Reader;
+import java.io.Writer;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
@@ -50,63 +60,79 @@ public final class Spoon {
   /** Whether or not the screenshot output directory needs cleared. */
   private static boolean outputNeedsClear = true;
 
-  private static class ScreenshotReceiver extends BroadcastReceiver {
+  private static class ScreenshotServer implements Runnable {
 
-    static final String EXTRA_FILE = "com.squareup.spoon.ScreenshotTaken.File";
-    static final String EXTRA_SUCCESS = "com.squareup.spoon.ScreenshotTaken.Success";
-    static final IntentFilter FILTER = new IntentFilter();
-
-    static {
-      FILTER.addAction("com.squareup.spoon.ScreenshotTaken");
+    private static enum CMD {
+      START, START_READY, CAPTURE, CAPTURE_FINISHED, ARGUMENTS, FINISHED, ERROR;
     }
 
-    private final CountDownLatch latch;
-    private final String filePath;
+    private final ServerSocket socket;
 
-    public boolean received;
-    public boolean success;
+    private boolean running;
 
-    public ScreenshotReceiver(final CountDownLatch latch, final String filePath) {
-      super();
-      this.latch = latch;
-      this.filePath = filePath;
-    }
-    
-    @Override
-    public void onReceive(Context context, Intent intent) {
-      final String action = intent.getAction();
+    public String screenshotName;
+    public String className;
+    public String methodName;
+    public int deviceOrientation;
 
-      Log.i(TAG, "receiving " + action);
-
-      if (FILTER.hasAction(action) && this.filePath.equals(intent.getStringExtra(EXTRA_FILE))) {
-        this.success = intent.getBooleanExtra(EXTRA_SUCCESS, false);
-        this.received = true;
-        this.latch.countDown();
+    public ScreenshotServer(int timeout) {
+      try {
+        socket = new ServerSocket(42042);
+        socket.setSoTimeout(timeout);
+      } catch (IOException e) {
+        throw new RuntimeException("Couldn't create screenshot server.", e);
       }
     }
-  }
 
-  private static class ScreenshotThread extends Thread {
-
-    private boolean isFinished;
-    public Handler handler;
-
-    public ScreenshotThread() {
-      super("ScreenshotThread");
-    }
-    
     @Override
     public void run() {
-      Looper.prepare();
-      this.handler = new Handler(Looper.myLooper());
-      
-      while (!isFinished) {
-        Looper.loop();
-      }
-    }
+      try {
+        Socket client = socket.accept();
+        BufferedReader reader = new BufferedReader(new InputStreamReader(client.getInputStream()));
+        PrintWriter writer = new PrintWriter(new OutputStreamWriter(client.getOutputStream()));
 
-    public void finish() {
-      this.isFinished = true;
+        writer.println(CMD.START);
+        this.running = true;
+        while (this.running) {
+          String response = reader.readLine();
+
+          switch (CMD.valueOf(response)) {
+          case START_READY:
+            writer.println(CMD.CAPTURE);
+            break;
+
+          case ARGUMENTS:
+            writer.println(CMD.ARGUMENTS);
+            writer.println(this.screenshotName);
+            writer.println(this.className);
+            writer.println(this.methodName);
+            writer.println(this.deviceOrientation);
+            break;
+
+          case CAPTURE_FINISHED:
+            writer.println(CMD.FINISHED);
+            this.running = false;
+            break;
+
+          case ERROR:
+            this.running = false;
+            break;
+
+          default:
+            throw new RuntimeException("Unexpected response: " + response);
+            // TODO retry strategy?
+          }
+        }
+        
+        writer.close();
+        reader.close();
+        client.close();
+
+      } catch (SocketTimeoutException e) {
+        throw new RuntimeException("No screenshot client connected", e);
+      } catch (IOException e) {
+        throw new RuntimeException("Unable to capture screenshot.", e);
+      }
     }
 
   }
@@ -128,7 +154,7 @@ public final class Spoon {
    * @param tag Unique tag to further identify the screenshot. Must match [a-zA-Z0-9_-]+.
    * @param timeout time to wait for DDMS to finish taking the screenshot
    */
-  public static void screenshotDDMS(Instrumentation instrumentation, String tag, final long timeout) {
+  public static void screenshotDDMS(Instrumentation instrumentation, String tag, final int timeout) {
     if (!TAG_VALIDATION.matcher(tag).matches()) {
       throw new IllegalArgumentException("Tag must match " + TAG_VALIDATION.pattern() + ".");
     }
@@ -136,62 +162,21 @@ public final class Spoon {
     final Context activity = instrumentation.getTargetContext();
 
     try {
-      final File screenshotDirectory = obtainScreenshotDirectory(activity);
-      final String screenshotName = System.currentTimeMillis() + NAME_SEPARATOR + tag + EXTENSION;
-      final String filePath = new File(screenshotDirectory, screenshotName).getAbsolutePath();
+      ScreenshotServer server = new ScreenshotServer(timeout);
 
-      // set up broadcast receiver to listen for results
-      final CountDownLatch done = new CountDownLatch(1);
-      final ScreenshotThread screenshotThread = new ScreenshotThread();
-      screenshotThread.start();
+      StackTraceElement testClass = findTestClassTraceElement(Thread.currentThread()
+          .getStackTrace());
 
-      ScreenshotReceiver shotReceiver = new ScreenshotReceiver(done, filePath);
-      activity.getApplicationContext().registerReceiver(shotReceiver, ScreenshotReceiver.FILTER,
-          null, screenshotThread.handler);
+      server.screenshotName = System.currentTimeMillis() + NAME_SEPARATOR + tag + EXTENSION;
+      server.className = testClass.getClassName().replaceAll("[^A-Za-z0-9._-]", "_");
+      server.methodName = testClass.getMethodName();
+      server.deviceOrientation = getDeviceOrientation(activity);
 
-      int deviceOrientation = getDeviceOrientation(activity);
-
-      // requesting android-screenshot-paparazzo to take a screenshot
-      final String args = String.format("{file=%s,orientation=%d}", filePath, deviceOrientation);
-      Log.i("screenshot_request", args);
-
-      instrumentation.runOnMainSync(new Runnable() {
-        @Override
-        public void run() {
-          waitForDdmsScreenshot(done, timeout);
-        }
-      });
-      
-      screenshotThread.finish();
-      activity.getApplicationContext().unregisterReceiver(shotReceiver);
-
-      if (!shotReceiver.success || !shotReceiver.received) {
-        throw new RuntimeException("Taking screenshot failed.");
-      }
+      instrumentation.runOnMainSync(server);
 
     } catch (Exception e) {
       throw new RuntimeException("Unable to capture screenshot.", e);
     }
-  }
-
-  private static void waitForDdmsScreenshot(final CountDownLatch done, final long timeout) {
-    final long startTime = System.currentTimeMillis();
-    final long maxWaitUntil = startTime + timeout;
-
-    while (maxWaitUntil > System.currentTimeMillis()) {
-      long timeToWait = maxWaitUntil - System.currentTimeMillis();
-      Log.i(TAG, String.format("Waiting %dms for screenshot on thread %s ...", timeToWait, Thread
-          .currentThread().getName()));
-
-      try {
-        done.await(500, TimeUnit.MILLISECONDS);
-        Thread.yield();
-      } catch (InterruptedException e) {
-        Log.w(TAG, e);
-      }
-    }
-
-    Log.i(TAG, String.format("... waited %dms", System.currentTimeMillis() - startTime));
   }
 
   private static int getDeviceOrientation(Context context) {
