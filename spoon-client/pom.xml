@@ -33,10 +33,5 @@
     	<groupId>com.google.android</groupId>
     	<artifactId>android-test</artifactId>
     </dependency>
-    <dependency>
-    	<groupId>io.netty</groupId>
-    	<artifactId>netty-all</artifactId>
-    	<version>4.0.0.Beta3</version>
-    </dependency>
   </dependencies>
 </project>

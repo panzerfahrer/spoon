@@ -71,11 +71,6 @@
       <artifactId>mockito-core</artifactId>
       <scope>test</scope>
     </dependency>
-    <dependency>
-    	<groupId>io.netty</groupId>
-    	<artifactId>netty-all</artifactId>
-    	<version>4.0.0.Beta3</version>
-    </dependency>
   </dependencies>
 
   <build>
