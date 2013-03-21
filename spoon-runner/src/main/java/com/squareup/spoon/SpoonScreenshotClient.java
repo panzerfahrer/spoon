@@ -1,31 +1,33 @@
 package com.squareup.spoon;
 
+import io.netty.bootstrap.Bootstrap;
+import io.netty.buffer.BufType;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOutboundMessageHandlerAdapter;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.codec.DelimiterBasedFrameDecoder;
+import io.netty.handler.codec.Delimiters;
+import io.netty.handler.codec.string.StringDecoder;
+import io.netty.handler.codec.string.StringEncoder;
+import io.netty.util.CharsetUtil;
+
 import java.awt.image.BufferedImage;
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutputStream;
-import java.io.OutputStreamWriter;
-import java.io.PrintWriter;
 import java.net.InetAddress;
-import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.SocketAddress;
 import java.net.UnknownHostException;
-import java.nio.channels.SocketChannel;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CountDownLatch;
 
-import android.text.TextUtils;
-
-import com.android.ddmlib.AndroidDebugBridge;
 import com.android.ddmlib.IDevice;
 import com.android.ddmlib.RawImage;
 import com.squareup.spoon.SpoonScreenshotServer.CMD;
@@ -68,10 +70,11 @@ public class SpoonScreenshotClient extends Thread {
   private final List<ScreenshotProcessor> processors;
   private final Map<String, Object> argumentsMap;
 
-  private boolean isRunning;
   private int adbPort;
   private Socket socket;
   private boolean isConnected;
+
+  private Channel clientChannel;
 
   /**
    * Create a new screenshot service
@@ -87,9 +90,15 @@ public class SpoonScreenshotClient extends Thread {
     this.argumentsMap = new HashMap<String, Object>(5);
   }
 
+  private void waitABit() {
+    try {
+      Thread.sleep(DEVICE_POLL_INTERVAL_MSEC);
+    } catch (InterruptedException e) {
+    }
+  }
+
   @Override
   public void run() {
-    this.isRunning = true;
 
     // Wait while the device comes online.
     while (device.isOffline()) {
@@ -108,81 +117,78 @@ public class SpoonScreenshotClient extends Thread {
       return;
     }
 
+    Bootstrap bootstrap = new Bootstrap();
     try {
-      clientMainLoop();
-    } catch (Exception e) {
-      SpoonLogger.logError("Error interacting with screenshot server: %s", e);
-      e.printStackTrace(System.err);
-    }
+      bootstrap.group(new NioEventLoopGroup());
+      bootstrap.channel(NioSocketChannel.class);
+      bootstrap.handler(new ClientInitializer());
 
-  }
+      ChannelFuture client = bootstrap.connect("localhost", this.adbPort);
+      clientChannel = client.sync().channel();
 
-  private void waitABit() {
-    try {
-      Thread.sleep(DEVICE_POLL_INTERVAL_MSEC);
     } catch (InterruptedException e) {
+    } finally {
+      bootstrap.shutdown();
     }
+
   }
 
-  private void clientMainLoop() throws IOException {
-    ObjectInputStream ois = null;
-    ObjectOutputStream oos = null;
+  private class ClientInitializer extends ChannelInitializer<SocketChannel> {
 
-    do {
+    private final StringDecoder DECODER = new StringDecoder(CharsetUtil.UTF_8);
+    private final StringEncoder ENCODER = new StringEncoder(BufType.BYTE, CharsetUtil.UTF_8);
+    private final ClientHandler HANDLER = new ClientHandler();
 
-      if (this.socket == null) {
-        connectToDevice();
-      }
+    @Override
+    protected void initChannel(SocketChannel channel) throws Exception {
+      ChannelPipeline pipeline = channel.pipeline();
 
-      if (ois == null || oos == null) {
-        try {
-          oos = new ObjectOutputStream(new BufferedOutputStream(this.socket.getOutputStream()));
-          ois = new ObjectInputStream(new BufferedInputStream(this.socket.getInputStream()));
-        } catch (IOException e) {
-          waitABit();
-          continue;
-        }
-      }
+      pipeline.addLast("framer", new DelimiterBasedFrameDecoder(512, Delimiters.lineDelimiter()));
+      pipeline.addLast("decoder", DECODER);
+      pipeline.addLast("encoder", ENCODER);
+      pipeline.addLast("handler", HANDLER);
+    }
 
-      String response = readServerResponse(ois);
+  }
+
+  private class ClientHandler extends ChannelOutboundMessageHandlerAdapter<String> {
+
+    @Override
+    public void flush(ChannelHandlerContext ctx, String response) throws Exception {
 
       if (response == null) {
         SpoonLogger.logInfo("empty server response");
-        continue;
+        return;
+      }
+
+      String[] argsStripped = null;
+      if (response.startsWith(CMD.ARGUMENTS.toString())) {
+        argsStripped = response.split("|");
+        response = argsStripped[0];
       }
 
       switch (CMD.valueOf(response)) {
       case START:
-        oos.writeObject(CMD.ARGUMENTS.toString());
+        ctx.write(CMD.ARGUMENTS.toString());
         break;
 
       case ARGUMENTS:
-        try {
-          String screenshotName = (String) ois.readObject();
-          String className = (String) ois.readObject();
-          String methodName = (String) ois.readObject();
-          Integer orientation = (Integer) ois.readObject();
-
-          this.argumentsMap.put(ARG_SCREENSHOT_NAME, screenshotName);
-          this.argumentsMap.put(ARG_CLASSNAME, className);
-          this.argumentsMap.put(ARG_METHODNAME, methodName);
-          this.argumentsMap.put(ARG_ORIENTATION, orientation);
-
-          oos.writeObject(CMD.CAPTURE_READY.toString());
-        } catch (ClassNotFoundException e) {
-          oos.writeObject(CMD.ERROR.toString());
-        }
-
+        SpoonScreenshotClient.this.argumentsMap.put(ARG_SCREENSHOT_NAME, argsStripped[1]);
+        SpoonScreenshotClient.this.argumentsMap.put(ARG_CLASSNAME, argsStripped[2]);
+        SpoonScreenshotClient.this.argumentsMap.put(ARG_METHODNAME, argsStripped[3]);
+        Integer orientation = Integer.valueOf(argsStripped[4]);
+        SpoonScreenshotClient.this.argumentsMap.put(ARG_ORIENTATION, orientation);
+        ctx.write(CMD.CAPTURE_READY.toString());
         break;
 
       case CAPTURE:
-        takeScreenshot();
-        oos.writeObject(CMD.CAPTURE_FINISHED.toString());
+        SpoonScreenshotClient.this.takeScreenshot();
+        ctx.write(CMD.CAPTURE_FINISHED.toString());
         break;
 
       case FINISHED:
         // clean up
-        this.argumentsMap.clear();
+        SpoonScreenshotClient.this.argumentsMap.clear();
         break;
 
       default:
@@ -190,27 +196,9 @@ public class SpoonScreenshotClient extends Thread {
         break;
 
       }
-    } while (this.isRunning);
 
-    this.isConnected = false;
-
-    if (this.socket != null) {
-      this.socket.shutdownInput();
-      this.socket.shutdownOutput();
-      this.socket.close();
-    }
-  }
-
-  private String readServerResponse(final ObjectInputStream ois) {
-    String response = null;
-
-    try {
-      response = (String) ois.readObject();
-    } catch (ClassNotFoundException e) {
-    } catch (IOException e) {
     }
 
-    return response;
   }
 
   /**
@@ -270,15 +258,14 @@ public class SpoonScreenshotClient extends Thread {
         waitABit();
       }
 
-    } while (this.isRunning && (!this.isConnected || this.socket == null));
+    } while (!this.isConnected || this.socket == null);
   }
 
   public void finish() {
-    this.isRunning = false;
+    this.clientChannel.closeFuture().syncUninterruptibly();
   }
 
   /**
-   * @param logLine
    * @author https://github.com/rtyley
    * @see com.github.rtyley.android.screenshot.paparazzo.OnDemandScreenshotService
    */

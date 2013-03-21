@@ -1,13 +1,23 @@
 package com.squareup.spoon;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.io.IOException;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutputStream;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.util.concurrent.CountDownLatch;
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.BufType;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundMessageHandlerAdapter;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.codec.DelimiterBasedFrameDecoder;
+import io.netty.handler.codec.Delimiters;
+import io.netty.handler.codec.string.StringDecoder;
+import io.netty.handler.codec.string.StringEncoder;
+import io.netty.util.CharsetUtil;
+
+import java.net.InetAddress;
+import java.nio.charset.Charset;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -18,13 +28,11 @@ import android.util.Log;
   private static final String TAG = "SpoonScreenshotServer";
 
   public static enum CMD {
-    START, CAPTURE_READY, CAPTURE, CAPTURE_FINISHED, ARGUMENTS, FINISHED, ERROR;
+    START, CAPTURE_READY, CAPTURE, CAPTURE_FINISHED, ARGUMENTS, FINISHED, ERROR, SHUTDOWN;
   }
 
-  private final AtomicBoolean isRunning;
   private final AtomicReference<ScreenshotRequest> request;
-
-  private ServerSocket socket;
+  private Channel serverChannel;
 
   /**
    * @param timeout
@@ -32,7 +40,6 @@ import android.util.Log;
   public SpoonScreenshotServer() {
     super("SpoonScreenshotServer");
 
-    this.isRunning = new AtomicBoolean();
     this.request = new AtomicReference<ScreenshotRequest>();
   }
 
@@ -47,186 +54,161 @@ import android.util.Log;
   public void requestScreenshot(String screenshotName, String className, String methodName,
       int deviceOrientation) {
 
-    final CountDownLatch finishedLatch = new CountDownLatch(1);
-    this.request.set(new ScreenshotRequest(screenshotName, className, methodName, Integer
-        .valueOf(deviceOrientation), finishedLatch));
+    ScreenshotRequest newReq = new ScreenshotRequest(screenshotName, className, methodName,
+        deviceOrientation);
 
-    try {
-      finishedLatch.await();
-    } catch (InterruptedException e) {
+    this.request.set(newReq);
+    this.serverChannel.write(CMD.START.toString());
+
+    while (!newReq.isFinished()) {
+      try {
+        Thread.sleep(250);
+      } catch (InterruptedException e) {
+      }
     }
-  }
 
-  public boolean isRunning() {
-    return this.isRunning.get();
+    this.request.set(null);
   }
 
   @Override
   public void run() {
-    this.isRunning.set(true);
 
+    ServerBootstrap bootstrap = new ServerBootstrap();
     try {
-      this.socket = new ServerSocket(42042);
-    } catch (IOException e) {
-      throw new RuntimeException("Couldn't create screenshot server.", e);
-    }
+      bootstrap.group(new NioEventLoopGroup(), new NioEventLoopGroup());
+      bootstrap.channel(NioServerSocketChannel.class);
+      bootstrap.localAddress(42042);
 
-    
-    serverMainLoop();
-  }
+      ServerInitializer.init(this.request);
+      bootstrap.childHandler(ServerInitializer.instance());
 
-  private void serverMainLoop() {
-    Log.i(TAG, "screenshot server started");
-    
-    try {
-      do {
-        try {
-          new ServerThread(this.socket.accept()).start();
-        } catch (IOException e) {
-          // error while waiting for client to connect
-        }
-      } while (this.isRunning.get());
+      serverChannel = bootstrap.bind().sync().channel();
+      // Wait until the server socket is closed.
+      serverChannel.closeFuture().sync();
 
+    } catch (Exception e) {
+      Log.w(TAG, e);
     } finally {
-      try {
-        this.socket.close();
-      } catch (IOException e) {
-      }
-    }
-    
-    Log.i(TAG, "screenshot server stopped");
-  }
-
-  private String readClientRequest(final ObjectInputStream ois) {
-    String request = null;
-
-    try {
-      request = (String) ois.readObject();
-    } catch (ClassNotFoundException e) {
-    } catch (IOException e) {
+      bootstrap.shutdown();
     }
 
-    return request;
   }
 
-  public void finish() {
-    this.isRunning.set(false);
+  private static class ServerInitializer extends ChannelInitializer<SocketChannel> {
 
-    try {
-      if (this.socket != null) {
-        this.socket.close();
-      }
-    } catch (IOException e) {
+    private static final Charset UTF8 = CharsetUtil.UTF_8;
+    private static final StringDecoder DECODER = new StringDecoder(UTF8);
+    private static final StringEncoder ENCODER = new StringEncoder(BufType.BYTE, UTF8);
+
+    private static ServerHandler handler;
+    private static ServerInitializer instance;
+
+    public static void init(AtomicReference<ScreenshotRequest> request) {
+      handler = new ServerHandler(request);
+      instance = new ServerInitializer();
     }
-  }
 
-  private class ServerThread extends Thread {
-
-    private final Socket client;
-
-    public ServerThread(Socket client) {
-      super("ServerThread");
-
-      this.client = client;
+    public static ServerInitializer instance() {
+      return instance;
     }
 
     @Override
-    public void run() {
-      Log.i(TAG, "client connected");
+    protected void initChannel(SocketChannel channel) throws Exception {
+      ChannelPipeline pipeline = channel.pipeline();
 
-      ObjectInputStream ois = null;
-      ObjectOutputStream oos = null;
-      ScreenshotRequest request = null;
-
-      do {
-        try {
-
-          if (ois == null || oos == null) {
-            try {
-              oos = new ObjectOutputStream(new BufferedOutputStream(this.client.getOutputStream()));
-              ois = new ObjectInputStream(new BufferedInputStream(this.client.getInputStream()));
-            } catch (IOException e) {
-              // error with setting up streams
-              continue;
-            }
-          }
-
-          if (request == null) {
-            request = SpoonScreenshotServer.this.request.get();
-            oos.writeObject(CMD.START.toString());
-            SpoonScreenshotServer.this.request.set(null);
-          }
-
-          Log.i(TAG, "reading client request");
-          String requestCmd = readClientRequest(ois);
-
-          if (request == null) {
-            Log.i(TAG, "empty request");
-            continue;
-          }
-
-          switch (CMD.valueOf(requestCmd)) {
-          case CAPTURE_READY:
-            oos.writeObject(CMD.CAPTURE.toString());
-            break;
-
-          case ARGUMENTS:
-            oos.writeObject(CMD.ARGUMENTS.toString());
-            oos.writeObject(request.screenshotName);
-            oos.writeObject(request.className);
-            oos.writeObject(request.methodName);
-            oos.writeObject(request.deviceOrientation);
-            request = null;
-            break;
-
-          case CAPTURE_FINISHED:
-            if (request.finished != null) {
-              request.finished.countDown();
-            }
-            request = null;
-            oos.writeObject(CMD.FINISHED.toString());
-            break;
-
-          case ERROR:
-            Log.w(TAG, "error: " + request);
-            break;
-
-          default:
-            Log.e(TAG, "Unexpected response: " + request);
-            break;
-          }
-        } catch (IOException e) {
-          Log.e(TAG, "error reading/sending commands", e);
-        }
-      } while (SpoonScreenshotServer.this.isRunning.get());
-
-      try {
-        ois.close();
-        oos.close();
-        client.close();
-      } catch (IOException e) {
-      }
-
-      Log.i(TAG, "client closed");
+      pipeline.addLast("framer", new DelimiterBasedFrameDecoder(512, Delimiters.lineDelimiter()));
+      pipeline.addLast("decoder", DECODER);
+      pipeline.addLast("encoder", ENCODER);
+      pipeline.addLast("handler", handler);      
     }
 
   }
 
+  private static class ServerHandler extends ChannelInboundMessageHandlerAdapter<String> {
+
+    private final AtomicReference<ScreenshotRequest> request;
+
+    public ServerHandler(AtomicReference<ScreenshotRequest> request) {
+      super();
+
+      this.request = request;
+    }
+
+    @Override
+    public void messageReceived(ChannelHandlerContext ctx, String msg) throws Exception {
+      if (msg == null) {
+        Log.i(TAG, "empty request");
+        return;
+      }
+
+      switch (CMD.valueOf(msg)) {
+      case CAPTURE_READY:
+        ctx.write(CMD.CAPTURE.toString());
+        break;
+
+      case ARGUMENTS:
+        ScreenshotRequest screenshotRequest = request.get();
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(CMD.ARGUMENTS.toString());
+        sb.append('|');
+        sb.append(screenshotRequest.screenshotName);
+        sb.append('|');
+        sb.append(screenshotRequest.className);
+        sb.append('|');
+        sb.append(screenshotRequest.methodName);
+        sb.append('|');
+        sb.append(screenshotRequest.deviceOrientation);
+
+        ctx.write(sb.toString());
+        break;
+
+      case CAPTURE_FINISHED:
+        request.get().markFinished();
+        ctx.write(CMD.FINISHED.toString());
+        break;
+
+      case ERROR:
+        Log.w(TAG, "error: " + request);
+        break;
+
+      default:
+        Log.e(TAG, "Unexpected response: " + request);
+        break;
+      }
+    }
+
+  }
+
+  public void finish() {
+    serverChannel.closeFuture().awaitUninterruptibly();
+  }
+
   private static final class ScreenshotRequest {
+
     public final String screenshotName;
     public final String className;
     public final String methodName;
     public final Integer deviceOrientation;
-    public final CountDownLatch finished;
+
+    private AtomicBoolean isFinished;
 
     public ScreenshotRequest(String screenshotName, String className, String methodName,
-        Integer deviceOrientation, CountDownLatch finished) {
+        int deviceOrientation) {
 
       this.screenshotName = screenshotName;
       this.className = className;
       this.methodName = methodName;
-      this.deviceOrientation = deviceOrientation;
-      this.finished = finished;
+      this.deviceOrientation = Integer.valueOf(deviceOrientation);
+      this.isFinished = new AtomicBoolean();
+    }
+
+    public void markFinished() {
+      this.isFinished.set(true);
+    }
+
+    public boolean isFinished() {
+      return this.isFinished.get();
     }
   }
 
