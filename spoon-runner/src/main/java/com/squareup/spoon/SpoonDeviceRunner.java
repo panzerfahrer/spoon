@@ -200,7 +200,7 @@ public final class SpoonDeviceRunner {
         }
       }
       
-      new Thread(screenshotClient).start();
+      screenshotClient.start();
       runner.run(new SpoonTestRunListener(result, debug));
       screenshotClient.finish();
     } catch (Exception e) {

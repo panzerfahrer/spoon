@@ -1,20 +1,34 @@
 package com.squareup.spoon;
 
 import java.awt.image.BufferedImage;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketAddress;
 import java.net.UnknownHostException;
+import java.nio.channels.SocketChannel;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 
+import android.text.TextUtils;
+
+import com.android.ddmlib.AndroidDebugBridge;
 import com.android.ddmlib.IDevice;
 import com.android.ddmlib.RawImage;
+import com.squareup.spoon.SpoonScreenshotServer.CMD;
 
 /**
  * Listens for screenshot requests during a test run and takes screenshots via DDMS.
@@ -22,23 +36,40 @@ import com.android.ddmlib.RawImage;
  * @author brho
  * 
  */
-public class SpoonScreenshotClient implements Runnable {
+public class SpoonScreenshotClient extends Thread {
 
+  private static final int DEVICE_POLL_INTERVAL_MSEC = 1000;
+
+  /**
+   * Device orientation during screenshot<br>
+   * Type: Integer
+   */
   public static final String ARG_ORIENTATION = "orientation";
-  public static final String ARG_SCREENSHOT_NAME = "screenshotname";
-  public static final String ARG_CLASSNAME = "classname";
-  public static final String ARG_METHODNAME = "methodname";
-  
-  private static enum CMD {
-    START, START_READY, CAPTURE, CAPTURE_FINISHED, ARGUMENTS, FINISHED, ERROR;
-  }
 
-  private final int devicePort;
+  /**
+   * Name of the screenshot<br>
+   * Type: String
+   */
+  public static final String ARG_SCREENSHOT_NAME = "screenshotname";
+
+  /**
+   * Name of test class<br>
+   * Type: String
+   */
+  public static final String ARG_CLASSNAME = "classname";
+
+  /**
+   * Name of the test method<br>
+   * Type: String
+   */
+  public static final String ARG_METHODNAME = "methodname";
+
   private final IDevice device;
   private final List<ScreenshotProcessor> processors;
   private final Map<String, Object> argumentsMap;
 
-  private boolean running;
+  private boolean isRunning;
+  private int adbPort;
   private Socket socket;
   private boolean isConnected;
 
@@ -49,95 +80,201 @@ public class SpoonScreenshotClient implements Runnable {
    * @param processor a {@link SpoonScreenshotProcessor} that will get the images handed through
    */
   public SpoonScreenshotClient(IDevice device, ScreenshotProcessor... processors) {
+    super("SpoonScreenshotClient");
+
     this.device = device;
     this.processors = Arrays.asList(processors);
     this.argumentsMap = new HashMap<String, Object>(5);
-
-    this.devicePort = 0;
-    // TODO adb port forwarding
   }
 
   @Override
   public void run() {
-    this.running = true;
+    this.isRunning = true;
 
-    connectToDevice();
-
-    try {
-      BufferedReader reader = new BufferedReader(
-          new InputStreamReader(this.socket.getInputStream()));
-      PrintWriter writer = new PrintWriter(new OutputStreamWriter(this.socket.getOutputStream()));
-
-      while (this.running) {
-        String response = reader.readLine();
-
-        switch (CMD.valueOf(response)) {
-        case START:
-          writer.println(CMD.START_READY);
-          break;
-
-        case ARGUMENTS:
-          if(CMD.valueOf(reader.readLine()) == CMD.ARGUMENTS){
-            String screenshotName = reader.readLine();
-            String className = reader.readLine();
-            String methodName = reader.readLine();
-            Integer orientation = Integer.valueOf(reader.readLine());
-            
-            this.argumentsMap.put(ARG_SCREENSHOT_NAME, screenshotName);
-            this.argumentsMap.put(ARG_CLASSNAME, className);
-            this.argumentsMap.put(ARG_METHODNAME, methodName);
-            this.argumentsMap.put(ARG_ORIENTATION, orientation);
-          } else {
-            writer.println(CMD.ERROR);
-          }
-          break;
-          
-        case CAPTURE:
-          takeScreenshot();
-          writer.println(CMD.CAPTURE_FINISHED);
-          break;
-
-        case FINISHED:
-          this.running = false;
-          break;
-          
-        }
-      }
-      
-      writer.close();
-      reader.close();
-      this.socket.close();
-      
-    } catch (IOException e) {
-
+    // Wait while the device comes online.
+    while (device.isOffline()) {
+      waitABit();
     }
 
+    int setupTries = 0;
+    boolean setupSuccess = false;
+    while (setupTries <= 3 && !setupSuccess) {
+      setupTries++;
+      setupSuccess = setupPortForwarding();
+    }
+
+    if (!setupSuccess) {
+      SpoonLogger.logError("Unable to set up port forwarding. Check connection.");
+      return;
+    }
+
+    try {
+      clientMainLoop();
+    } catch (Exception e) {
+      SpoonLogger.logError("Error interacting with screenshot server: %s", e);
+      e.printStackTrace(System.err);
+    }
+
+  }
+
+  private void waitABit() {
+    try {
+      Thread.sleep(DEVICE_POLL_INTERVAL_MSEC);
+    } catch (InterruptedException e) {
+    }
+  }
+
+  private void clientMainLoop() throws IOException {
+    ObjectInputStream ois = null;
+    ObjectOutputStream oos = null;
+
+    do {
+
+      if (this.socket == null) {
+        connectToDevice();
+      }
+
+      if (ois == null || oos == null) {
+        try {
+          oos = new ObjectOutputStream(new BufferedOutputStream(this.socket.getOutputStream()));
+          ois = new ObjectInputStream(new BufferedInputStream(this.socket.getInputStream()));
+        } catch (IOException e) {
+          waitABit();
+          continue;
+        }
+      }
+
+      String response = readServerResponse(ois);
+
+      if (response == null) {
+        SpoonLogger.logInfo("empty server response");
+        continue;
+      }
+
+      switch (CMD.valueOf(response)) {
+      case START:
+        oos.writeObject(CMD.ARGUMENTS.toString());
+        break;
+
+      case ARGUMENTS:
+        try {
+          String screenshotName = (String) ois.readObject();
+          String className = (String) ois.readObject();
+          String methodName = (String) ois.readObject();
+          Integer orientation = (Integer) ois.readObject();
+
+          this.argumentsMap.put(ARG_SCREENSHOT_NAME, screenshotName);
+          this.argumentsMap.put(ARG_CLASSNAME, className);
+          this.argumentsMap.put(ARG_METHODNAME, methodName);
+          this.argumentsMap.put(ARG_ORIENTATION, orientation);
+
+          oos.writeObject(CMD.CAPTURE_READY.toString());
+        } catch (ClassNotFoundException e) {
+          oos.writeObject(CMD.ERROR.toString());
+        }
+
+        break;
+
+      case CAPTURE:
+        takeScreenshot();
+        oos.writeObject(CMD.CAPTURE_FINISHED.toString());
+        break;
+
+      case FINISHED:
+        // clean up
+        this.argumentsMap.clear();
+        break;
+
+      default:
+        SpoonLogger.logError("Unexpected command: %s", response);
+        break;
+
+      }
+    } while (this.isRunning);
+
+    this.isConnected = false;
+
+    if (this.socket != null) {
+      this.socket.shutdownInput();
+      this.socket.shutdownOutput();
+      this.socket.close();
+    }
+  }
+
+  private String readServerResponse(final ObjectInputStream ois) {
+    String response = null;
+
+    try {
+      response = (String) ois.readObject();
+    } catch (ClassNotFoundException e) {
+    } catch (IOException e) {
+    }
+
+    return response;
+  }
+
+  /**
+   * Find a free port and set up ADB port forwarding. If successful, the port will be set to
+   * {@link #adbPort}.
+   * 
+   * @return <code>true</code> if port forwarding has been established successfully,
+   *         <code>false</code> otherwise
+   * 
+   */
+  private boolean setupPortForwarding() {
+
+    if (this.device != null) {
+      ServerSocket tmpSocket = null;
+
+      try {
+        tmpSocket = new ServerSocket(0);
+        this.adbPort = tmpSocket.getLocalPort();
+      } catch (IOException e) {
+        throw new RuntimeException("Couldn't select a free port.", e);
+      } finally {
+        if (tmpSocket != null) {
+          try {
+            tmpSocket.close();
+          } catch (IOException e) {
+          }
+        }
+      }
+
+      SpoonLogger.logInfo("port forwarding %d -> 42042", this.adbPort);
+
+      try {
+        this.device.createForward(this.adbPort, 42042);
+        return true;
+      } catch (Exception e) {
+        return false;
+      }
+    }
+
+    return false;
   }
 
   private void connectToDevice() {
-    while (this.running) {
+    do {
       try {
-        this.socket = new Socket("localhost", this.devicePort);
+        this.socket = new Socket("localhost", this.adbPort);
         this.isConnected = true;
-      } catch (UnknownHostException e) {
-        throw new RuntimeException("Couldn't set up screenshot client.", e);
       } catch (IOException e) {
+        SpoonLogger.logError("failed to connect to device: %s", e);
         this.isConnected = false;
       }
 
-      if (!this.isConnected) {
-        try {
-          Thread.sleep(250);
-        } catch (InterruptedException e) {
-        }
-      } else {
-        break;
+      if (!this.isConnected || this.socket == null) {
+        this.isConnected = false;
+
+        SpoonLogger.logInfo("waiting for screenshot server");
+        waitABit();
       }
-    }
+
+    } while (this.isRunning && (!this.isConnected || this.socket == null));
   }
 
   public void finish() {
-    this.running = false;
+    this.isRunning = false;
   }
 
   /**
@@ -150,12 +287,12 @@ public class SpoonScreenshotClient implements Runnable {
     try {
       rawImage = this.device.getScreenshot();
     } catch (Exception e) {
-      // log.warn("Exception getting raw image data for screenshot", e);
+      SpoonLogger.logError("Exception getting raw image data for screenshot: %s", e);
       return;
     }
 
     if (rawImage == null) {
-      // log.warn("No image data returned for screenshot");
+      SpoonLogger.logError("No image data returned for screenshot");
       return;
     }
 

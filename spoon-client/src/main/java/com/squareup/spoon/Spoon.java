@@ -7,36 +7,21 @@ import static com.squareup.spoon.Chmod.chmodPlusR;
 import static com.squareup.spoon.Chmod.chmodPlusRWX;
 
 import java.io.BufferedOutputStream;
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
-import java.io.OutputStreamWriter;
-import java.io.PrintWriter;
-import java.io.Reader;
-import java.io.Writer;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.net.SocketTimeoutException;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
 import android.app.Activity;
 import android.app.Instrumentation;
-import android.content.BroadcastReceiver;
 import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.os.Build;
-import android.os.Handler;
 import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.util.Log;
@@ -51,91 +36,12 @@ public final class Spoon {
   static final String TEST_CASE_CLASS = "android.test.InstrumentationTestCase";
   static final String TEST_CASE_METHOD = "runMethod";
   private static final String EXTENSION = ".png";
-  private static final String TAG = "Spoon";
+  static final String TAG = "Spoon";
   private static final Object LOCK = new Object();
   private static final Pattern TAG_VALIDATION = Pattern.compile("[a-zA-Z0-9_-]+");
 
-  private static final int MAX_SCREENSHOT_WAIT = 10000;
-
   /** Whether or not the screenshot output directory needs cleared. */
   private static boolean outputNeedsClear = true;
-
-  private static class ScreenshotServer implements Runnable {
-
-    private static enum CMD {
-      START, START_READY, CAPTURE, CAPTURE_FINISHED, ARGUMENTS, FINISHED, ERROR;
-    }
-
-    private final ServerSocket socket;
-
-    private boolean running;
-
-    public String screenshotName;
-    public String className;
-    public String methodName;
-    public int deviceOrientation;
-
-    public ScreenshotServer(int timeout) {
-      try {
-        socket = new ServerSocket(42042);
-        socket.setSoTimeout(timeout);
-      } catch (IOException e) {
-        throw new RuntimeException("Couldn't create screenshot server.", e);
-      }
-    }
-
-    @Override
-    public void run() {
-      try {
-        Socket client = socket.accept();
-        BufferedReader reader = new BufferedReader(new InputStreamReader(client.getInputStream()));
-        PrintWriter writer = new PrintWriter(new OutputStreamWriter(client.getOutputStream()));
-
-        writer.println(CMD.START);
-        this.running = true;
-        while (this.running) {
-          String response = reader.readLine();
-
-          switch (CMD.valueOf(response)) {
-          case START_READY:
-            writer.println(CMD.CAPTURE);
-            break;
-
-          case ARGUMENTS:
-            writer.println(CMD.ARGUMENTS);
-            writer.println(this.screenshotName);
-            writer.println(this.className);
-            writer.println(this.methodName);
-            writer.println(this.deviceOrientation);
-            break;
-
-          case CAPTURE_FINISHED:
-            writer.println(CMD.FINISHED);
-            this.running = false;
-            break;
-
-          case ERROR:
-            this.running = false;
-            break;
-
-          default:
-            throw new RuntimeException("Unexpected response: " + response);
-            // TODO retry strategy?
-          }
-        }
-        
-        writer.close();
-        reader.close();
-        client.close();
-
-      } catch (SocketTimeoutException e) {
-        throw new RuntimeException("No screenshot client connected", e);
-      } catch (IOException e) {
-        throw new RuntimeException("Unable to capture screenshot.", e);
-      }
-    }
-
-  }
 
   /**
    * Let DDMS take a screenshot with the specified tag.
@@ -144,42 +50,30 @@ public final class Spoon {
    * @param tag Unique tag to further identify the screenshot. Must match [a-zA-Z0-9_-]+.
    */
   public static void screenshotDDMS(Instrumentation instrumentation, String tag) {
-    screenshotDDMS(instrumentation, tag, MAX_SCREENSHOT_WAIT);
-  }
-
-  /**
-   * Let DDMS take a screenshot with the specified tag.
-   * 
-   * @param activity Activity with which to capture a screenshot.
-   * @param tag Unique tag to further identify the screenshot. Must match [a-zA-Z0-9_-]+.
-   * @param timeout time to wait for DDMS to finish taking the screenshot
-   */
-  public static void screenshotDDMS(Instrumentation instrumentation, String tag, final int timeout) {
     if (!TAG_VALIDATION.matcher(tag).matches()) {
       throw new IllegalArgumentException("Tag must match " + TAG_VALIDATION.pattern() + ".");
     }
 
-    final Context activity = instrumentation.getTargetContext();
+    if (instrumentation instanceof SpoonTestRunner) {
 
-    try {
-      ScreenshotServer server = new ScreenshotServer(timeout);
+      final Context activity = instrumentation.getTargetContext();
 
-      StackTraceElement testClass = findTestClassTraceElement(Thread.currentThread()
+      StackTraceElement testClass = Spoon.findTestClassTraceElement(Thread.currentThread()
           .getStackTrace());
+      String screenshotName = System.currentTimeMillis() + NAME_SEPARATOR + tag + EXTENSION;
+      String className = testClass.getClassName().replaceAll("[^A-Za-z0-9._-]", "_");
+      String methodName = testClass.getMethodName();
+      int deviceOrientation = Spoon.getDeviceOrientation(activity);
 
-      server.screenshotName = System.currentTimeMillis() + NAME_SEPARATOR + tag + EXTENSION;
-      server.className = testClass.getClassName().replaceAll("[^A-Za-z0-9._-]", "_");
-      server.methodName = testClass.getMethodName();
-      server.deviceOrientation = getDeviceOrientation(activity);
-
-      instrumentation.runOnMainSync(server);
-
-    } catch (Exception e) {
-      throw new RuntimeException("Unable to capture screenshot.", e);
+      ((SpoonTestRunner) instrumentation).requestScreenshot(screenshotName, className, methodName,
+          deviceOrientation);
+    } else {
+      throw new RuntimeException("Your test runner class must be an instance of "
+          + SpoonTestRunner.class.getName());
     }
   }
 
-  private static int getDeviceOrientation(Context context) {
+  /* package */static int getDeviceOrientation(Context context) {
 
     final WindowManager wm = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
     final Display defaultDisplay = wm.getDefaultDisplay();
