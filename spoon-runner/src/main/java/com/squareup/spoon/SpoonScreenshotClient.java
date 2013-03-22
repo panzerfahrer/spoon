@@ -3,31 +3,34 @@ package com.squareup.spoon;
 import java.awt.image.BufferedImage;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
-import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
-import java.io.OutputStreamWriter;
-import java.io.PrintWriter;
-import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.SocketAddress;
-import java.net.UnknownHostException;
+import java.net.SocketException;
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
 import java.nio.channels.SocketChannel;
+import java.nio.charset.Charset;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 
-import android.text.TextUtils;
+import org.apache.commons.lang3.CharSetUtils;
 
-import com.android.ddmlib.AndroidDebugBridge;
+import com.android.ddmlib.AdbCommandRejectedException;
 import com.android.ddmlib.IDevice;
+import com.android.ddmlib.Log;
+import com.android.ddmlib.MultiLineReceiver;
 import com.android.ddmlib.RawImage;
+import com.android.ddmlib.ShellCommandUnresponsiveException;
+import com.android.ddmlib.TimeoutException;
 import com.squareup.spoon.SpoonScreenshotServer.CMD;
 
 /**
@@ -38,6 +41,8 @@ import com.squareup.spoon.SpoonScreenshotServer.CMD;
  */
 public class SpoonScreenshotClient extends Thread {
 
+  private static final String LOG_CMD = "logcat -v raw -b main %s:I *:S";
+  private static final Charset UTF_8 = Charset.forName("UTF-8");
   private static final int DEVICE_POLL_INTERVAL_MSEC = 1000;
 
   /**
@@ -67,11 +72,12 @@ public class SpoonScreenshotClient extends Thread {
   private final IDevice device;
   private final List<ScreenshotProcessor> processors;
   private final Map<String, Object> argumentsMap;
+  private final ArrayBlockingQueue<String> pendingLines;
 
   private boolean isRunning;
   private int adbPort;
-  private Socket socket;
-  private boolean isConnected;
+  private ServerInfoReceiver serverInfoReceiver;
+  private SocketChannel socket;
 
   /**
    * Create a new screenshot service
@@ -79,20 +85,40 @@ public class SpoonScreenshotClient extends Thread {
    * @param device the device to take screenshots from
    * @param processor a {@link SpoonScreenshotProcessor} that will get the images handed through
    */
-  public SpoonScreenshotClient(IDevice device, ScreenshotProcessor... processors) {
+  public SpoonScreenshotClient(final IDevice device, ScreenshotProcessor... processors) {
     super("SpoonScreenshotClient");
 
     this.device = device;
     this.processors = Arrays.asList(processors);
     this.argumentsMap = new HashMap<String, Object>(5);
+    this.serverInfoReceiver = new ServerInfoReceiver();
+    this.pendingLines = new ArrayBlockingQueue<String>(10);
+
+    new Thread(new Runnable() {
+      @Override
+      public void run() {
+        try {
+          String logcat = String.format(LOG_CMD, SpoonScreenshotServer.TAG);
+          device.executeShellCommand(logcat, serverInfoReceiver, 0);
+        } catch (TimeoutException e) {
+          SpoonLogger.logError("Unable to get server info. Check connection.");
+        } catch (AdbCommandRejectedException e) {
+          SpoonLogger.logError("Unable to get server info. Check connection.");
+        } catch (ShellCommandUnresponsiveException e) {
+          SpoonLogger.logError("Unable to get server info. Check connection.");
+        } catch (IOException e) {
+          SpoonLogger.logError("Unable to get server info. Check connection.");
+        }
+      }
+    }).start();
   }
 
   @Override
   public void run() {
     this.isRunning = true;
 
-    // Wait while the device comes online.
-    while (device.isOffline()) {
+    while (this.serverInfoReceiver.getServerPort() < 0) {
+      SpoonLogger.logError("Waiting for server information");
       waitABit();
     }
 
@@ -124,93 +150,115 @@ public class SpoonScreenshotClient extends Thread {
     }
   }
 
-  private void clientMainLoop() throws IOException {
-    ObjectInputStream ois = null;
-    ObjectOutputStream oos = null;
+  private void clientMainLoop() throws IOException, TimeoutException {
+    InetSocketAddress server = new InetSocketAddress("localhost", this.adbPort);
+    this.socket = SocketChannel.open(server);
+    this.socket.configureBlocking(false);
+    this.socket.socket().setTcpNoDelay(true);
 
-    do {
+    byte[] data = new byte[1024];
+    ByteBuffer buffer = ByteBuffer.wrap(data);
 
-      if (this.socket == null) {
-        connectToDevice();
-      }
+    try {
+      do {
+        String response = read(buffer);
 
-      if (ois == null || oos == null) {
-        try {
-          oos = new ObjectOutputStream(new BufferedOutputStream(this.socket.getOutputStream()));
-          ois = new ObjectInputStream(new BufferedInputStream(this.socket.getInputStream()));
-        } catch (IOException e) {
-          waitABit();
+        if (response == null) {
+          SpoonLogger.logInfo("empty server response");
           continue;
         }
-      }
 
-      String response = readServerResponse(ois);
+        switch (CMD.valueOf(response)) {
+        case START:
+          write(CMD.ARGUMENTS.toString());
+          break;
 
-      if (response == null) {
-        SpoonLogger.logInfo("empty server response");
-        continue;
-      }
-
-      switch (CMD.valueOf(response)) {
-      case START:
-        oos.writeObject(CMD.ARGUMENTS.toString());
-        break;
-
-      case ARGUMENTS:
-        try {
-          String screenshotName = (String) ois.readObject();
-          String className = (String) ois.readObject();
-          String methodName = (String) ois.readObject();
-          Integer orientation = (Integer) ois.readObject();
+        case ARGUMENTS:
+          String screenshotName = read(buffer);
+          String className = read(buffer);
+          String methodName = read(buffer);
+          Integer orientation = Integer.parseInt(read(buffer));
 
           this.argumentsMap.put(ARG_SCREENSHOT_NAME, screenshotName);
           this.argumentsMap.put(ARG_CLASSNAME, className);
           this.argumentsMap.put(ARG_METHODNAME, methodName);
           this.argumentsMap.put(ARG_ORIENTATION, orientation);
 
-          oos.writeObject(CMD.CAPTURE_READY.toString());
-        } catch (ClassNotFoundException e) {
-          oos.writeObject(CMD.ERROR.toString());
+          write(CMD.CAPTURE_READY.toString());
+          break;
+
+        case CAPTURE:
+          takeScreenshot();
+          write(CMD.CAPTURE_FINISHED.toString());
+          break;
+
+        case FINISHED:
+          // clean up
+          this.argumentsMap.clear();
+          break;
+
+        default:
+          SpoonLogger.logError("Unexpected command: %s", response);
+          break;
+
         }
-
-        break;
-
-      case CAPTURE:
-        takeScreenshot();
-        oos.writeObject(CMD.CAPTURE_FINISHED.toString());
-        break;
-
-      case FINISHED:
-        // clean up
-        this.argumentsMap.clear();
-        break;
-
-      default:
-        SpoonLogger.logError("Unexpected command: %s", response);
-        break;
-
+      } while (this.isRunning);
+      
+    } finally {
+      if (this.socket != null) {
+        this.socket.close();
       }
-    } while (this.isRunning);
-
-    this.isConnected = false;
-
-    if (this.socket != null) {
-      this.socket.shutdownInput();
-      this.socket.shutdownOutput();
-      this.socket.close();
     }
+
   }
 
-  private String readServerResponse(final ObjectInputStream ois) {
-    String response = null;
+  private String read(ByteBuffer buffer) throws IOException {
+    int readCount;
+    readCount = this.socket.read(buffer);
 
-    try {
-      response = (String) ois.readObject();
-    } catch (ClassNotFoundException e) {
-    } catch (IOException e) {
+    if (readCount < 0) {
+      // connection gone
+      throw new IOException("channel EOF");
+    } else if (readCount == 0) {
+      waitABit();
+    } else {
+      String newLines = new String(buffer.array(), buffer.arrayOffset(), buffer.position(), UTF_8);
+      buffer.rewind();
+
+      for (String line : newLines.split("\n")) {
+        pendingLines.add(line);
+      }
     }
 
-    return response;
+    return pendingLines.poll();
+  }
+
+  private void write(String data) throws IOException, TimeoutException {
+    StringBuilder sb = new StringBuilder(data);
+    sb.append("\n");
+    
+    byte[] dataBytes = sb.toString().getBytes(UTF_8);
+    ByteBuffer buf = ByteBuffer.wrap(dataBytes, 0, dataBytes.length);
+    int numWaits = 0;
+
+    while (buf.position() != buf.limit()) {
+      int count;
+
+      count = this.socket.write(buf);
+      if (count < 0) {
+        throw new IOException("channel EOF");
+      } else if (count == 0) {
+        // TODO: need more accurate timeout?
+        if (numWaits > 5) {
+          throw new TimeoutException();
+        }
+        // non-blocking spin
+        waitABit();
+        numWaits++;
+      } else {
+        numWaits = 0;
+      }
+    }
   }
 
   /**
@@ -240,10 +288,11 @@ public class SpoonScreenshotClient extends Thread {
         }
       }
 
-      SpoonLogger.logInfo("port forwarding %d -> 42042", this.adbPort);
+      SpoonLogger.logInfo("port forwarding %d -> %d", this.adbPort,
+          this.serverInfoReceiver.getServerPort());
 
       try {
-        this.device.createForward(this.adbPort, 42042);
+        this.device.createForward(this.adbPort, this.serverInfoReceiver.getServerPort());
         return true;
       } catch (Exception e) {
         return false;
@@ -253,27 +302,8 @@ public class SpoonScreenshotClient extends Thread {
     return false;
   }
 
-  private void connectToDevice() {
-    do {
-      try {
-        this.socket = new Socket("localhost", this.adbPort);
-        this.isConnected = true;
-      } catch (IOException e) {
-        SpoonLogger.logError("failed to connect to device: %s", e);
-        this.isConnected = false;
-      }
-
-      if (!this.isConnected || this.socket == null) {
-        this.isConnected = false;
-
-        SpoonLogger.logInfo("waiting for screenshot server");
-        waitABit();
-      }
-
-    } while (this.isRunning && (!this.isConnected || this.socket == null));
-  }
-
   public void finish() {
+    this.serverInfoReceiver.cancel();
     this.isRunning = false;
   }
 
@@ -322,6 +352,49 @@ public class SpoonScreenshotClient extends Thread {
       }
     }
     return image;
+  }
+
+  private static final class ServerInfoReceiver extends MultiLineReceiver {
+
+    private boolean isCancelled;
+    private int serverPort = -1;
+
+    public ServerInfoReceiver() {
+      setTrimLine(false);
+    }
+
+    @Override
+    public void processNewLines(String[] lines) {
+      List<String> lineList = Arrays.asList(lines);
+      Collections.reverse(lineList); // process list beginning with the last entry
+
+      for (String data : lineList) {
+        if (data.startsWith("port:")) {
+          SpoonLogger.logInfo("server info: %s", data);
+          String port = data.split(":")[1];
+          try {
+            this.serverPort = Integer.parseInt(port);
+            this.cancel();
+            return;
+          } catch (NumberFormatException e) {
+          }
+        }
+      }
+    }
+
+    @Override
+    public boolean isCancelled() {
+      return this.isCancelled;
+    }
+
+    public int getServerPort() {
+      return serverPort;
+    }
+
+    public void cancel() {
+      this.isCancelled = true;
+    }
+
   }
 
 }
