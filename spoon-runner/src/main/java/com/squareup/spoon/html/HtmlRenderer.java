@@ -27,10 +27,12 @@ import static com.google.common.base.Charsets.UTF_8;
 
 /** Renders a {@link com.squareup.spoon.SpoonSummary} as static HTML to an output directory. */
 public final class HtmlRenderer {
+  public static final String INDEX_FILENAME = "index.html";
   private static final String STATIC_DIRECTORY = "static";
   private static final String[] STATIC_ASSETS = {
     "bootstrap.min.css", "bootstrap-responsive.min.css", "bootstrap.min.js", "jquery.min.js",
-    "icon-animated.png", "icon-devices.png", "icon-log.png", "ceiling_android.png"
+    "jquery.nivo.slider.pack.js", "nivo-slider.css", "icon-animated.png", "icon-devices.png",
+    "icon-log.png", "ceiling_android.png", "arrows.png", "bullets.png", "loading.gif"
   };
 
   private final SpoonSummary summary;
@@ -51,6 +53,7 @@ public final class HtmlRenderer {
     writeResultJson();
 
     MustacheFactory mustacheFactory = new DefaultMustacheFactory();
+    generateTvHtml(mustacheFactory);
     generateIndexHtml(mustacheFactory);
     generateDeviceHtml(mustacheFactory);
     generateTestHtml(mustacheFactory);
@@ -89,10 +92,17 @@ public final class HtmlRenderer {
     }
   }
 
+  private void generateTvHtml(MustacheFactory mustacheFactory) {
+    Mustache mustache = mustacheFactory.compile("page/tv.html");
+    HtmlTv scope = HtmlTv.from(gson, summary, output);
+    File file = new File(output, "tv.html");
+    renderMustacheToFile(mustache, scope, file);
+  }
+
   private void generateIndexHtml(MustacheFactory mustacheFactory) {
     Mustache mustache = mustacheFactory.compile("page/index.html");
     HtmlIndex scope = HtmlIndex.from(summary);
-    File file = new File(output, "index.html");
+    File file = new File(output, INDEX_FILENAME);
     renderMustacheToFile(mustache, scope, file);
   }
 

@@ -1,6 +1,7 @@
 package com.squareup.spoon;
 
 import com.android.ddmlib.AndroidDebugBridge;
+import com.android.ddmlib.testrunner.IRemoteAndroidTestRunner;
 import com.beust.jcommander.IStringConverter;
 import com.beust.jcommander.JCommander;
 import com.beust.jcommander.Parameter;
@@ -28,7 +29,8 @@ import static java.util.Collections.unmodifiableSet;
 /** Represents a collection of devices and the test configuration to be executed. */
 public final class SpoonRunner {
   private static final String DEFAULT_TITLE = "Spoon Execution";
-  static final String DEFAULT_OUTPUT_DIRECTORY = "spoon-output";
+  public static final String DEFAULT_OUTPUT_DIRECTORY = "spoon-output";
+  private static final int DEFAULT_ADB_TIMEOUT = 10 * 60; //10 minutes
 
   private final String title;
   private final File androidSdk;
@@ -36,24 +38,36 @@ public final class SpoonRunner {
   private final File instrumentationApk;
   private final File output;
   private final boolean debug;
+  private final boolean noAnimations;
+  private final int adbTimeout;
   private final String className;
   private final String methodName;
   private final Set<String> serials;
   private final String classpath;
+  private final IRemoteAndroidTestRunner.TestSize testSize;
 
   private SpoonRunner(String title, File androidSdk, File applicationApk, File instrumentationApk,
-      File output, boolean debug, Set<String> serials, String classpath, String className,
-      String methodName) {
+      File output, boolean debug, boolean noAnimations, int adbTimeout, Set<String> serials, String classpath,
+      String className, String methodName, IRemoteAndroidTestRunner.TestSize testSize) {
     this.title = title;
     this.androidSdk = androidSdk;
     this.applicationApk = applicationApk;
     this.instrumentationApk = instrumentationApk;
     this.output = output;
     this.debug = debug;
+    this.noAnimations = noAnimations;
+    this.adbTimeout = adbTimeout;
     this.className = className;
     this.methodName = methodName;
-    this.serials = unmodifiableSet(serials);
     this.classpath = classpath;
+    this.testSize = testSize;
+
+    // Sanitize the serials for use on the filesystem as a folder name.
+    Set<String> serialsCopy = new LinkedHashSet<String>(serials.size());
+    for (String serial : serials) {
+      serialsCopy.add(SpoonUtils.sanitizeSerial(serial));
+    }
+    this.serials = unmodifiableSet(serialsCopy);
   }
 
   /**
@@ -87,7 +101,7 @@ public final class SpoonRunner {
 
   private SpoonSummary runTests(AndroidDebugBridge adb, Set<String> serials) {
     int targetCount = serials.size();
-    logInfo("Executing instrumentation on %d devices.", targetCount);
+    logInfo("Executing instrumentation suite on %d device(s).", targetCount);
 
     try {
       FileUtils.deleteDirectory(output);
@@ -96,11 +110,16 @@ public final class SpoonRunner {
     }
 
     final SpoonInstrumentationInfo testInfo = parseFromFile(instrumentationApk);
-    logDebug(debug, "%s in %s", testInfo.getApplicationPackage(), applicationApk.getAbsolutePath());
-    logDebug(debug, "%s in %s", testInfo.getInstrumentationPackage(),
+    logDebug(debug, "Application: %s from %s", testInfo.getApplicationPackage(),
+        applicationApk.getAbsolutePath());
+    logDebug(debug, "Instrumentation: %s from %s", testInfo.getInstrumentationPackage(),
         instrumentationApk.getAbsolutePath());
 
     final SpoonSummary.Builder summary = new SpoonSummary.Builder().setTitle(title).start();
+
+    if (testSize != null) {
+      summary.setTestSize(testSize);
+    }
 
     if (targetCount == 1) {
       // Since there is only one device just execute it synchronously in this process.
@@ -175,7 +194,7 @@ public final class SpoonRunner {
 
   private SpoonDeviceRunner getTestRunner(String serial, SpoonInstrumentationInfo testInfo) {
     return new SpoonDeviceRunner(androidSdk, applicationApk, instrumentationApk, output, serial,
-        debug, classpath, testInfo, className, methodName);
+        debug, noAnimations, adbTimeout, classpath, testInfo, className, methodName, testSize);
   }
 
   /** Build a test suite for the specified devices and configuration. */
@@ -190,6 +209,9 @@ public final class SpoonRunner {
     private String classpath = System.getProperty("java.class.path");
     private String className;
     private String methodName;
+    private boolean noAnimations;
+    private IRemoteAndroidTestRunner.TestSize testSize;
+    private int adbTimeout;
 
     /** Identifying title for this execution. */
     public Builder setTitle(String title) {
@@ -235,6 +257,18 @@ public final class SpoonRunner {
       return this;
     }
 
+    /** Whether or not animations are enabled. */
+    public Builder setNoAnimations(boolean noAnimations) {
+      this.noAnimations = noAnimations;
+      return this;
+    }
+
+    /** Set ADB timeout. */
+    public Builder setAdbTimeout(int value) {
+      this.adbTimeout = value;
+      return this;
+    }
+
     /** Add a device serial for test execution. */
     public Builder addDevice(String serial) {
       checkNotNull(serial, "Serial cannot be null.");
@@ -270,6 +304,11 @@ public final class SpoonRunner {
       return this;
     }
 
+    public Builder setTestSize(IRemoteAndroidTestRunner.TestSize testSize) {
+      this.testSize = testSize;
+      return this;
+    }
+
     public Builder setMethodName(String methodName) {
       this.methodName = methodName;
       return this;
@@ -288,7 +327,7 @@ public final class SpoonRunner {
       }
 
       return new SpoonRunner(title, androidSdk, applicationApk, instrumentationApk, output, debug,
-          serials, classpath, className, methodName);
+          noAnimations, adbTimeout, serials, classpath, className, methodName, testSize);
     }
   }
 
@@ -311,6 +350,10 @@ public final class SpoonRunner {
         "Test method name to run (must also use --class-name)")
     public String methodName;
 
+    @Parameter(names = { "--size" }, converter = TestSizeConverter.class,
+        description = "Only run methods with corresponding size annotation (small, medium, large)")
+    public IRemoteAndroidTestRunner.TestSize size;
+
     @Parameter(names = { "--output" }, description = "Output path",
         converter = FileConverter.class)
     public File output = cleanFile(SpoonRunner.DEFAULT_OUTPUT_DIRECTORY);
@@ -320,6 +363,12 @@ public final class SpoonRunner {
 
     @Parameter(names = { "--fail-on-failure" }, description = "Non-zero exit code on failure")
     public boolean failOnFailure;
+
+    @Parameter(names = { "--no-animations" }, description = "Disable animated gif generation")
+    public boolean noAnimations;
+
+    @Parameter(names = { "--adb-timeout" }, description = "Set maximum execution time per test in seconds (10min default)")
+    public int adbTimeoutSeconds = DEFAULT_ADB_TIMEOUT;
 
     @Parameter(names = { "--debug" }, hidden = true)
     public boolean debug;
@@ -339,6 +388,17 @@ public final class SpoonRunner {
   public static class FileConverter implements IStringConverter<File> {
     @Override public File convert(String s) {
       return cleanFile(s);
+    }
+  }
+
+  public static class TestSizeConverter
+      implements IStringConverter<IRemoteAndroidTestRunner.TestSize> {
+    @Override public IRemoteAndroidTestRunner.TestSize convert(String value) {
+      try {
+        return IRemoteAndroidTestRunner.TestSize.getTestSize(value);
+      } catch (IllegalArgumentException e) {
+        throw new ParameterException(e.getMessage());
+      }
     }
   }
 
@@ -367,6 +427,9 @@ public final class SpoonRunner {
         .setOutputDirectory(parsedArgs.output)
         .setDebug(parsedArgs.debug)
         .setAndroidSdk(parsedArgs.sdk)
+        .setNoAnimations(parsedArgs.noAnimations)
+        .setTestSize(parsedArgs.size)
+        .setAdbTimeout(parsedArgs.adbTimeoutSeconds * 1000)
         .setClassName(parsedArgs.className)
         .setMethodName(parsedArgs.methodName)
         .useAllAttachedDevices()

@@ -102,6 +102,9 @@ Options:
     --title             Execution title
     --class-name        Test class name to run (fully-qualified)
     --method-name       Test method name to run (must also use --class-name)
+    --no-animations     Disable animated gif generation
+    --size              Only run test methods annotated by testSize (small, medium, large)
+    --adb-timeout       Set maximum execution time per test in seconds (10min default)
 ```
 
 If you are using Maven for compilation, a plugin is provided for easy execution.
@@ -125,14 +128,14 @@ application.
   <artifactId>example-app</artifactId>
   <version>${project.version}</version>
   <type>jar</type>
-  <scope>provied</scope>
+  <scope>provided</scope>
 </dependency>
 <dependency>
   <groupId>com.example</groupId>
   <artifactId>example-app</artifactId>
   <version>${project.version}</version>
   <type>apk</type>
-  <scope>provied</scope>
+  <scope>provided</scope>
 </dependency>
 ```
 

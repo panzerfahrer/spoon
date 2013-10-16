@@ -3,7 +3,10 @@ package com.squareup.spoon;
 import com.android.ddmlib.AndroidDebugBridge;
 import com.android.ddmlib.IDevice;
 import com.android.ddmlib.InstallException;
+import com.android.ddmlib.SyncService;
+import com.android.ddmlib.logcat.LogCatMessage;
 import com.android.ddmlib.testrunner.RemoteAndroidTestRunner;
+import com.android.ddmlib.testrunner.IRemoteAndroidTestRunner;
 import com.google.common.base.Strings;
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.Multimap;
@@ -27,7 +30,6 @@ import static com.squareup.spoon.SpoonLogger.logDebug;
 import static com.squareup.spoon.SpoonLogger.logError;
 import static com.squareup.spoon.SpoonLogger.logInfo;
 import static com.squareup.spoon.SpoonUtils.GSON;
-import static com.squareup.spoon.SpoonUtils.QUIET_MONITOR;
 import static com.squareup.spoon.SpoonUtils.createAnimatedGif;
 import static com.squareup.spoon.SpoonUtils.obtainDirectoryFileEntry;
 import static com.squareup.spoon.SpoonUtils.obtainRealDevice;
@@ -37,16 +39,21 @@ public final class SpoonDeviceRunner {
   private static final String FILE_EXECUTION = "execution.json";
   private static final String FILE_RESULT = "result.json";
   static final String TEMP_DIR = "work";
+  static final String JUNIT_DIR = "junit-reports";
 
   private final File sdk;
   private final File apk;
   private final File testApk;
   private final String serial;
   private final boolean debug;
+  private final boolean noAnimations;
+  private final int adbTimeout;
   private final File output;
   private final String className;
   private final String methodName;
+  private final IRemoteAndroidTestRunner.TestSize testSize;
   private final File work;
+  private final File junitReport;
   private final String classpath;
   private final SpoonInstrumentationInfo instrumentationInfo;
 
@@ -59,6 +66,7 @@ public final class SpoonDeviceRunner {
    * @param output Path to output directory.
    * @param serial Device to run the test on.
    * @param debug Whether or not debug logging is enabled.
+   * @param adbTimeout time in ms for longest test execution
    * @param classpath Custom JVM classpath or {@code null}.
    * @param instrumentationInfo Test apk manifest information.
    * @param className Test class name to run or {@code null} to run all tests.
@@ -66,22 +74,26 @@ public final class SpoonDeviceRunner {
    *        {@code className}.
    */
   SpoonDeviceRunner(File sdk, File apk, File testApk, File output, String serial, boolean debug,
-      String classpath, SpoonInstrumentationInfo instrumentationInfo, String className,
-      String methodName) {
+      boolean noAnimations, int adbTimeout, String classpath, SpoonInstrumentationInfo instrumentationInfo,
+      String className, String methodName, IRemoteAndroidTestRunner.TestSize testSize) {
     this.sdk = sdk;
     this.apk = apk;
     this.testApk = testApk;
     this.serial = serial;
     this.debug = debug;
+    this.noAnimations = noAnimations;
+    this.adbTimeout = adbTimeout;
     this.output = output;
     this.className = className;
     this.methodName = methodName;
+    this.testSize = testSize;
     this.work = FileUtils.getFile(output, TEMP_DIR, serial);
+    this.junitReport = FileUtils.getFile(output, JUNIT_DIR, serial + ".xml");
     this.classpath = classpath;
     this.instrumentationInfo = instrumentationInfo;
   }
 
-  /** Serialize ourself to disk and start {@link #main(String...)} in another process. */
+  /** Serialize to disk and start {@link #main(String...)} in another process. */
   public DeviceResult runInNewProcess() throws IOException, InterruptedException {
     logDebug(debug, "[%s]", serial);
 
@@ -95,10 +107,11 @@ public final class SpoonDeviceRunner {
 
     // Kick off a new process to interface with ADB and perform the real execution.
     String name = SpoonDeviceRunner.class.getName();
-    Process process =
-        new ProcessBuilder("java", "-cp", classpath, name, work.getAbsolutePath()).start();
+    Process process = new ProcessBuilder("java", "-Djava.awt.headless=true", "-cp", classpath, name,
+        work.getAbsolutePath()).start();
     printStream(process.getInputStream(), "STDOUT");
     printStream(process.getErrorStream(), "STDERR");
+
     final int exitCode = process.waitFor();
     logDebug(debug, "Process.waitFor() finished for [%s] with exitCode %d", serial, exitCode);
 
@@ -140,10 +153,6 @@ public final class SpoonDeviceRunner {
     logDebug(debug, "[%s] setDeviceDetails %s", serial, deviceDetails);
 
     try {
-      // First try to uninstall the old apks.  This will avoid "inconsistent certificate" errors.
-      tryToUninstall(device, instrumentationInfo.getApplicationPackage());
-      tryToUninstall(device, instrumentationInfo.getInstrumentationPackage());
-
       // Now install the main application and the instrumentation application.
       String installError = device.installPackage(apk.getAbsolutePath(), true);
       if (installError != null) {
@@ -161,6 +170,9 @@ public final class SpoonDeviceRunner {
       return result.markInstallAsFailed(e.getMessage()).build();
     }
 
+    // Create the output directory, if it does not already exist.
+    work.mkdirs();
+
     // Initiate device logging.
     SpoonDeviceLogger deviceLogger = new SpoonDeviceLogger(device);
 
@@ -168,6 +180,7 @@ public final class SpoonDeviceRunner {
     try {
       logDebug(debug, "About to actually run tests for [%s]", serial);
       RemoteAndroidTestRunner runner = new RemoteAndroidTestRunner(testPackage, testRunner, device);
+      runner.setMaxtimeToOutputResponse(adbTimeout);
       if (!Strings.isNullOrEmpty(className)) {
         if (Strings.isNullOrEmpty(methodName)) {
           runner.setClassName(className);
@@ -175,14 +188,20 @@ public final class SpoonDeviceRunner {
           runner.setMethodName(className, methodName);
         }
       }
-      runner.run(new SpoonTestRunListener(result, debug));
+      if (testSize != null) {
+        runner.setTestSize(testSize);
+      }
+      runner.run(
+          new SpoonTestRunListener(result, debug),
+          new XmlTestRunListener(junitReport)
+      );
     } catch (Exception e) {
       result.addException(e);
     }
 
     // Grab all the parsed logs and map them to individual tests.
-    Map<DeviceTest, List<DeviceLogMessage>> logs = deviceLogger.getParsedLogs();
-    for (Map.Entry<DeviceTest, List<DeviceLogMessage>> entry : logs.entrySet()) {
+    Map<DeviceTest, List<LogCatMessage>> logs = deviceLogger.getParsedLogs();
+    for (Map.Entry<DeviceTest, List<LogCatMessage>> entry : logs.entrySet()) {
       DeviceTestResult.Builder builder = result.getMethodResultBuilder(entry.getKey());
       if (builder != null) {
         builder.setLog(entry.getValue());
@@ -191,8 +210,6 @@ public final class SpoonDeviceRunner {
 
     try {
       logDebug(debug, "About to grab screenshots and prepare output for [%s]", serial);
-      // Create the output directory, if it does not already exist.
-      work.mkdirs();
 
       // Sync device screenshots, if any, to the local filesystem.
       String dirName = "app_" + SPOON_SCREENSHOTS;
@@ -201,7 +218,8 @@ public final class SpoonDeviceRunner {
       FileEntry deviceDir = obtainDirectoryFileEntry(devicePath);
       logDebug(debug, "Pulling screenshots from [%s] %s", serial, devicePath);
 
-      device.getSyncService().pull(new FileEntry[] {deviceDir}, localDirName, QUIET_MONITOR);
+      device.getSyncService()
+          .pull(new FileEntry[] {deviceDir}, localDirName, SyncService.getNullProgressMonitor());
 
       File screenshotDir = new File(work, dirName);
       if (screenshotDir.exists()) {
@@ -211,49 +229,48 @@ public final class SpoonDeviceRunner {
         // Move all children of the screenshot directory into the image folder.
         File[] classNameDirs = screenshotDir.listFiles();
         if (classNameDirs != null) {
-          Multimap<DeviceTest, File> screenshots = ArrayListMultimap.create();
+          Multimap<DeviceTest, File> testScreenshots = ArrayListMultimap.create();
           for (File classNameDir : classNameDirs) {
             String className = classNameDir.getName();
             File destDir = new File(imageDir, className);
             FileUtils.copyDirectory(classNameDir, destDir);
-            for (File screenshot : FileUtils.listFiles(destDir, TrueFileFilter.INSTANCE,
-                TrueFileFilter.INSTANCE)) {
+
+            // Get a sorted list of all screenshots from the device run.
+            List<File> screenshots = new ArrayList<File>(
+                FileUtils.listFiles(destDir, TrueFileFilter.INSTANCE, TrueFileFilter.INSTANCE));
+            Collections.sort(screenshots);
+
+            // Iterate over each screenshot and associate it with its corresponding method result.
+            for (File screenshot : screenshots) {
               String methodName = screenshot.getParentFile().getName();
 
-              // Add screenshot to appropriate method result.
               DeviceTest testIdentifier = new DeviceTest(className, methodName);
               DeviceTestResult.Builder builder = result.getMethodResultBuilder(testIdentifier);
               if (builder != null) {
                 builder.addScreenshot(screenshot);
-                screenshots.put(testIdentifier, screenshot);
+                testScreenshots.put(testIdentifier, screenshot);
               } else {
                 logError("Unable to find test for %s", testIdentifier);
               }
             }
           }
 
-          // Make animated GIFs for all the tests which have screenshots.
-          for (DeviceTest deviceTest : screenshots.keySet()) {
-            List<File> testScreenshots = new ArrayList<File>(screenshots.get(deviceTest));
-            if (testScreenshots.size() == 1) {
-              continue; // Do not make an animated GIF if there is only one screenshot.
+          // Don't generate animations if the switch is present
+          if (!noAnimations) {
+            // Make animated GIFs for all the tests which have screenshots.
+            for (DeviceTest deviceTest : testScreenshots.keySet()) {
+              List<File> screenshots = new ArrayList<File>(testScreenshots.get(deviceTest));
+              if (screenshots.size() == 1) {
+                continue; // Do not make an animated GIF if there is only one screenshot.
+              }
+              File animatedGif = FileUtils.getFile(imageDir, deviceTest.getClassName(),
+                  deviceTest.getMethodName() + ".gif");
+              createAnimatedGif(screenshots, animatedGif);
+              result.getMethodResultBuilder(deviceTest).setAnimatedGif(animatedGif);
             }
-            Collections.sort(testScreenshots);
-            File animatedGif = FileUtils.getFile(imageDir, deviceTest.getClassName(),
-                deviceTest.getMethodName() + ".gif");
-            createAnimatedGif(testScreenshots, animatedGif);
-            result.getMethodResultBuilder(deviceTest).setAnimatedGif(animatedGif);
           }
         }
-        try {
-          FileUtils.deleteDirectory(screenshotDir);
-        } catch (IOException ignored) {
-          // DDMS r16 bug on Windows. Le sigh.
-          logInfo(
-              "Warning: IOException when trying to delete %s.  If you're not on Windows, panic.",
-              screenshotDir);
-          FileUtils.forceDeleteOnExit(screenshotDir);
-        }
+        FileUtils.deleteDirectory(screenshotDir);
       }
     } catch (Exception e) {
       result.addException(e);
@@ -262,19 +279,11 @@ public final class SpoonDeviceRunner {
     return result.build();
   }
 
-  private static void tryToUninstall(IDevice device, String appId) {
-    try {
-      device.uninstallPackage(appId);
-    } catch (InstallException e) {
-      logInfo("[%s] Unable to uninstall %s", device.getSerialNumber(), appId);
-    }
-  }
-
   /////////////////////////////////////////////////////////////////////////////
   ////  Secondary Per-Device Process  /////////////////////////////////////////
   /////////////////////////////////////////////////////////////////////////////
 
-  /** Deserialize ourselves from disk, run the tests, and serialize the result back to disk. */
+  /** De-serialize from disk, run the tests, and serialize the result back to disk. */
   public static void main(String... args) {
     if (args.length != 1) {
       throw new IllegalArgumentException("Must be started with a device directory.");
