@@ -9,6 +9,8 @@ import com.google.gson.TypeAdapter;
 import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonWriter;
 import com.madgag.gif.fmsware.AnimatedGifEncoder;
+import java.awt.Color;
+import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.Constructor;
@@ -17,16 +19,17 @@ import java.lang.reflect.InvocationTargetException;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.regex.Pattern;
 import javax.imageio.ImageIO;
 import org.apache.commons.io.FileUtils;
 
 import static com.android.ddmlib.FileListingService.FileEntry;
 import static com.android.ddmlib.FileListingService.TYPE_DIRECTORY;
 import static com.android.ddmlib.Log.LogLevel.DEBUG;
-import static com.android.ddmlib.SyncService.ISyncProgressMonitor;
 
 /** Utilities for executing instrumentation tests on devices. */
 final class SpoonUtils {
+  private static final Pattern SERIAL_VALIDATION = Pattern.compile("[^a-zA-Z0-9_-]");
   static final Gson GSON = new GsonBuilder() //
       .registerTypeAdapter(File.class, new TypeAdapter<File>() {
         @Override public void write(JsonWriter jsonWriter, File file) throws IOException {
@@ -45,24 +48,6 @@ final class SpoonUtils {
       .setPrettyPrinting() //
       .create();
 
-  static final ISyncProgressMonitor QUIET_MONITOR = new ISyncProgressMonitor() {
-        @Override public void start(int totalWork) {
-        }
-
-        @Override public void stop() {
-        }
-
-        @Override public boolean isCanceled() {
-          return false;
-        }
-
-        @Override public void startSubTask(String name) {
-        }
-
-        @Override public void advance(int work) {
-        }
-      };
-
   /** Fetch or create a real device that corresponds to a device model. */
   static IDevice obtainRealDevice(AndroidDebugBridge adb, String serial) {
     // Get an existing real device.
@@ -72,6 +57,10 @@ final class SpoonUtils {
       }
     }
     throw new IllegalArgumentException("Unknown device serial: " + serial);
+  }
+
+  static String sanitizeSerial(String serial) {
+    return SERIAL_VALIDATION.matcher(serial).replaceAll("_");
   }
 
   /** Get a {@link FileEntry} for an arbitrary path. */
@@ -126,12 +115,24 @@ final class SpoonUtils {
   static void createAnimatedGif(List<File> testScreenshots, File animatedGif) throws IOException {
     AnimatedGifEncoder encoder = new AnimatedGifEncoder();
     encoder.start(animatedGif.getAbsolutePath());
-    encoder.setDelay(1000 /* 1 second */);
+    encoder.setDelay(1500 /* 1.5 seconds */);
     encoder.setQuality(1 /* highest */);
     encoder.setRepeat(0 /* infinite */);
+    encoder.setTransparent(Color.WHITE);
+
+    int width = 0;
+    int height = 0;
+    for (File testScreenshot : testScreenshots) {
+      BufferedImage bufferedImage = ImageIO.read(testScreenshot);
+      width = Math.max(bufferedImage.getWidth(), width);
+      height = Math.max(bufferedImage.getHeight(), height);
+    }
+    encoder.setSize(width, height);
+
     for (File testScreenshot : testScreenshots) {
       encoder.addFrame(ImageIO.read(testScreenshot));
     }
+
     encoder.finish();
   }
 
