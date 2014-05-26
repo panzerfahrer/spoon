@@ -5,7 +5,6 @@ import static com.squareup.spoon.SpoonLogger.logDebug;
 import static com.squareup.spoon.SpoonLogger.logError;
 import static com.squareup.spoon.SpoonLogger.logInfo;
 import static com.squareup.spoon.SpoonUtils.GSON;
-import static com.squareup.spoon.SpoonUtils.QUIET_MONITOR;
 import static com.squareup.spoon.SpoonUtils.createAnimatedGif;
 import static com.squareup.spoon.SpoonUtils.obtainDirectoryFileEntry;
 import static com.squareup.spoon.SpoonUtils.obtainRealDevice;
@@ -22,18 +21,22 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.filefilter.TrueFileFilter;
-import com.squareup.spoon.adapters.TestIdentifierAdapter;
 
 import com.android.ddmlib.AndroidDebugBridge;
 import com.android.ddmlib.FileListingService.FileEntry;
 import com.android.ddmlib.IDevice;
 import com.android.ddmlib.InstallException;
+import com.android.ddmlib.SyncService;
+import com.android.ddmlib.logcat.LogCatMessage;
+import com.android.ddmlib.testrunner.IRemoteAndroidTestRunner;
 import com.android.ddmlib.testrunner.RemoteAndroidTestRunner;
 import com.google.common.base.Strings;
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.Multimap;
+import com.squareup.spoon.adapters.TestIdentifierAdapter;
 
 /** Represents a single device and the test configuration to be executed. */
 public final class SpoonDeviceRunner {
@@ -181,13 +184,13 @@ public final class SpoonDeviceRunner {
     work.mkdirs();
 
     // create the output directory, if it does not already exist.
-    File imageDir = FileUtils.getFile(output, "image", serial);
+    File imageDir = FileUtils.getFile(work, "image", serial);
     imageDir.mkdirs();
 
     final String dirName = "app_" + SPOON_SCREENSHOTS;
     final String localDirName = work.getAbsolutePath();
     final String devicePath = "/data/data/" + appPackage + "/" + dirName;
-    Multimap<DeviceTest, File> screenshots = ArrayListMultimap.create();
+    Multimap<DeviceTest, File> testScreenshots = ArrayListMultimap.create();
 
     SpoonScreenshotProcessor shotProcessor = new SpoonScreenshotProcessor(device, imageDir);
     SpoonScreenshotClient screenshotClient = new SpoonScreenshotClient(device, shotProcessor);
@@ -240,7 +243,7 @@ public final class SpoonDeviceRunner {
       if (builder != null) {
         File screenshot = entry.getValue();
         builder.addScreenshot(screenshot);
-        screenshots.put(testIdentifier, screenshot);
+        testScreenshots.put(testIdentifier, screenshot);
       }
     }
 
@@ -297,9 +300,9 @@ public final class SpoonDeviceRunner {
           // Don't generate animations if the switch is present
           if (!noAnimations) {
             // Make animated GIFs for all the tests which have screenshots.
-            for (DeviceTest deviceTest : screenshots.keySet()) {
-              List<File> testScreenshots = new ArrayList<File>(screenshots.get(deviceTest));
-              if (testScreenshots.size() == 1) {
+            for (DeviceTest deviceTest : testScreenshots.keySet()) {
+              List<File> screenshots = new ArrayList<File>(testScreenshots.get(deviceTest));
+              if (screenshots.size() == 1) {
                 continue; // Do not make an animated GIF if there is only one screenshot.
               }
               File animatedGif = FileUtils.getFile(imageDir, deviceTest.getClassName(),

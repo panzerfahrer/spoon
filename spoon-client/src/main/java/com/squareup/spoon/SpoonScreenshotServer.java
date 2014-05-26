@@ -2,7 +2,6 @@ package com.squareup.spoon;
 
 import java.io.IOException;
 import java.io.ObjectInputStream;
-import java.io.ObjectOutputStream;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.ServerSocketChannel;
@@ -32,7 +31,7 @@ import android.util.Log;
   private ServerSocketChannel socket;
 
   /**
-   * @param timeout
+   *
    */
   public SpoonScreenshotServer() {
     super("SpoonScreenshotServer");

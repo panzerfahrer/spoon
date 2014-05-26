@@ -1,17 +1,10 @@
 package com.squareup.spoon;
 
 import java.awt.image.BufferedImage;
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
 import java.io.IOException;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
-import java.net.Socket;
-import java.net.SocketException;
 import java.nio.ByteBuffer;
-import java.nio.CharBuffer;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.Charset;
 import java.util.Arrays;
@@ -20,13 +13,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
-
-import org.apache.commons.lang3.CharSetUtils;
 
 import com.android.ddmlib.AdbCommandRejectedException;
 import com.android.ddmlib.IDevice;
-import com.android.ddmlib.Log;
 import com.android.ddmlib.MultiLineReceiver;
 import com.android.ddmlib.RawImage;
 import com.android.ddmlib.ShellCommandUnresponsiveException;
@@ -99,7 +88,7 @@ public class SpoonScreenshotClient extends Thread {
       public void run() {
         try {
           String logcat = String.format(LOG_CMD, SpoonScreenshotServer.TAG);
-          device.executeShellCommand(logcat, serverInfoReceiver, 0);
+          device.executeShellCommand(logcat, serverInfoReceiver);
         } catch (TimeoutException e) {
           SpoonLogger.logError("Unable to get server info. Check connection.");
         } catch (AdbCommandRejectedException e) {
@@ -308,11 +297,12 @@ public class SpoonScreenshotClient extends Thread {
   }
 
   /**
-   * @param logLine
    * @author https://github.com/rtyley
    * @see com.github.rtyley.android.screenshot.paparazzo.OnDemandScreenshotService
    */
   private void takeScreenshot() {
+    SpoonLogger.logInfo("taking screenshot from %s", this.device.getSerialNumber());
+
     RawImage rawImage;
     try {
       rawImage = this.device.getScreenshot();

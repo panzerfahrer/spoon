@@ -4,6 +4,7 @@ import android.app.Application;
 import android.app.KeyguardManager;
 import android.os.PowerManager;
 import android.test.InstrumentationTestRunner;
+import com.squareup.spoon.SpoonTestRunner;
 
 import static android.content.Context.KEYGUARD_SERVICE;
 import static android.content.Context.POWER_SERVICE;
@@ -15,7 +16,7 @@ import static android.os.PowerManager.ON_AFTER_RELEASE;
  * Test runner which disables the keyguard and wake up the screen during execution. Requires test
  * application have {@code android.permission.DISABLE_KEYGUARD} permission declared.
  **/
-public class SpoonInstrumentationTestRunner extends InstrumentationTestRunner {
+public class SpoonInstrumentationTestRunner extends SpoonTestRunner {
   @Override public void onStart() {
     runOnMainSync(new Runnable() {
       @Override public void run() {
