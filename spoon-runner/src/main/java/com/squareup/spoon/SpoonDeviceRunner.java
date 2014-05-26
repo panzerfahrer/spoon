@@ -24,6 +24,7 @@ import java.util.Map;
 import java.util.Map.Entry;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.filefilter.TrueFileFilter;
+import com.squareup.spoon.adapters.TestIdentifierAdapter;
 
 import com.android.ddmlib.AndroidDebugBridge;
 import com.android.ddmlib.FileListingService.FileEntry;
@@ -40,6 +41,7 @@ public final class SpoonDeviceRunner {
   private static final String FILE_RESULT = "result.json";
   static final String TEMP_DIR = "work";
   static final String JUNIT_DIR = "junit-reports";
+  static final String IMAGE_DIR = "image";
 
   private final File sdk;
   private final File apk;
@@ -48,12 +50,12 @@ public final class SpoonDeviceRunner {
   private final boolean debug;
   private final boolean noAnimations;
   private final int adbTimeout;
-  private final File output;
   private final String className;
   private final String methodName;
   private final IRemoteAndroidTestRunner.TestSize testSize;
   private final File work;
   private final File junitReport;
+  private final File imageDir;
   private final String classpath;
   private final SpoonInstrumentationInfo instrumentationInfo;
 
@@ -74,8 +76,9 @@ public final class SpoonDeviceRunner {
    *          {@code className}.
    */
   SpoonDeviceRunner(File sdk, File apk, File testApk, File output, String serial, boolean debug,
-      boolean noAnimations, int adbTimeout, String classpath, SpoonInstrumentationInfo instrumentationInfo,
-      String className, String methodName, IRemoteAndroidTestRunner.TestSize testSize) {
+      boolean noAnimations, int adbTimeout, String classpath,
+      SpoonInstrumentationInfo instrumentationInfo, String className, String methodName,
+      IRemoteAndroidTestRunner.TestSize testSize) {
     this.sdk = sdk;
     this.apk = apk;
     this.testApk = testApk;
@@ -83,14 +86,16 @@ public final class SpoonDeviceRunner {
     this.debug = debug;
     this.noAnimations = noAnimations;
     this.adbTimeout = adbTimeout;
-    this.output = output;
     this.className = className;
     this.methodName = methodName;
     this.testSize = testSize;
-    this.work = FileUtils.getFile(output, TEMP_DIR, serial);
-    this.junitReport = FileUtils.getFile(output, JUNIT_DIR, serial + ".xml");
     this.classpath = classpath;
     this.instrumentationInfo = instrumentationInfo;
+
+    serial = SpoonUtils.sanitizeSerial(serial);
+    this.work = FileUtils.getFile(output, TEMP_DIR, serial);
+    this.junitReport = FileUtils.getFile(output, JUNIT_DIR, serial + ".xml");
+    this.imageDir = FileUtils.getFile(output, IMAGE_DIR, serial);
   }
 
   /** Serialize to disk and start {@link #main(String...)} in another process. */
@@ -136,6 +141,8 @@ public final class SpoonDeviceRunner {
     String appPackage = instrumentationInfo.getApplicationPackage();
     String testPackage = instrumentationInfo.getInstrumentationPackage();
     String testRunner = instrumentationInfo.getTestRunnerClass();
+    TestIdentifierAdapter testIdentifierAdapter = TestIdentifierAdapter.fromTestRunner(testRunner);
+
     logDebug(debug, "InstrumentationInfo: [%s]", instrumentationInfo);
 
     if (debug) {
@@ -207,7 +214,7 @@ public final class SpoonDeviceRunner {
         runner.setTestSize(testSize);
       }
       runner.run(
-          new SpoonTestRunListener(result, debug),
+          new SpoonTestRunListener(result, debug, testIdentifierAdapter),
           new XmlTestRunListener(junitReport)
       );
       screenshotClient.finish();
@@ -254,6 +261,7 @@ public final class SpoonDeviceRunner {
 
       File screenshotDir = new File(work, dirName);
       if (screenshotDir.exists()) {
+        imageDir.mkdirs();
 
         // Move all children of the screenshot directory into the image folder.
         File[] classNameDirs = screenshotDir.listFiles();
